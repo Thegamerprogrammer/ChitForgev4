@@ -1,4 +1,5 @@
 import { countWords, speakingSeconds, stripMarkdown } from './format.js';
+import countryList from 'world-countries';
 
 const validationTests = ['Agenda relevance', 'Portfolio alignment', 'Target relevance', 'Evidence exists', 'No fabricated citation', 'Legal classification accurate', 'POI usable in MUN', 'Aggression matches slider', 'Controversy matches slider', 'Diplomacy matches slider', 'Length matches slider', 'Word count calculated', 'Speaking time calculated', 'Important phrases emphasized', 'No ceremonial opening', 'Simple English', 'Direct question', 'Strong pressure point', 'Distinct tactical purpose'];
 
@@ -15,10 +16,16 @@ export function normalizeClassification(value) {
   return original && normalized !== 'AUTO' ? original : 'ACCOUNTABILITY';
 }
 
+const COUNTRY_ALIASES = new Map(countryList.flatMap((country) => [[country.cca3, country.cca3], [country.cca2, country.cca3], [country.name.common, country.cca3], [country.name.official, country.cca3], ...(country.altSpellings || []).map((name) => [name, country.cca3])]).map(([key, value]) => [String(key || '').trim().toLowerCase(), value]));
+function countryKey(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  return COUNTRY_ALIASES.get(raw) || raw;
+}
 export function assertPortfolioSafety({ portfolioCountry, targetCountry, oppositionCountries = [], oppositionOnly = false }) {
-  const norm = (v) => String(v || '').trim().toLowerCase();
-  if (targetCountry && norm(targetCountry) === norm(portfolioCountry)) throw new Error('Target safety blocked generation: portfolio country cannot be targeted.');
-  if (oppositionOnly && targetCountry && !oppositionCountries.some((c) => norm(c.name || c) === norm(targetCountry) || norm(c.iso) === norm(targetCountry))) throw new Error('Target safety blocked generation: target is not in selected opposition countries.');
+  const portfolioKey = countryKey(portfolioCountry);
+  const targetKey = countryKey(targetCountry);
+  if (targetCountry && targetKey === portfolioKey) throw new Error('Target safety blocked generation: portfolio country cannot be targeted.');
+  if (oppositionOnly && targetCountry && !oppositionCountries.some((c) => countryKey(c.name || c) === targetKey || countryKey(c.iso) === targetKey)) throw new Error('Target safety blocked generation: target is not in selected opposition countries.');
   return true;
 }
 

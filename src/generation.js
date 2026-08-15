@@ -30,7 +30,7 @@ export async function runResearchPacket({ form, missionState, modelSelection, on
   const params = assertRuntime(missionState, runtimeParams(missionState, missionState.oppositionCountries.map((c) => c.name).join(', ') || 'GLOBAL'));
   const prompt = `${MASTER_SYSTEM_PROMPT}\nReturn JSON only. Build a research packet with portfolioProfile and pressurePoints[]. Use Google Search grounding/retrieval. Do not use pretrained memory as evidence. If retrieval is unavailable return {"status":"RESEARCH UNAVAILABLE","pressurePoints":[]} and mark MANUAL VERIFICATION.\nRUNTIME PARAMETERS: ${JSON.stringify(params)}\nCOMMITTEE:${form.committee}\nAGENDA:${form.agenda}\nPORTFOLIO:${missionState.portfolioCountry}\nTARGETS:${JSON.stringify(missionState.oppositionCountries)}\nRESEARCH NOTES:${missionState.researchNotes}\nRESEARCH LINKS:${missionState.researchLinks.join('\n')}\nBACKGROUND GUIDE:${missionState.backgroundGuideText.slice(0,8000)}\nFREEZE DATE:${missionState.freezeDate}\nFind scandals/controversies and verified historical bad events separately. Each pressure point needs id,type,target,eventDate,sourceName,organization,url,publicationDate,claim,evidenceExcerpt,agendaRelevance,portfolioRelevance,legalRelevance,verificationStatus.`;
   const response = await callGemini(form.apiKey, prompt, { ...modelSelection, useGoogleSearch: true, requestContext: { stage: 'Researching Pressure Points', operation: 'grounded-research' } });
-  const packet = { status: 'READY', raw: extractJson(response.text), model: response.model, cacheKey: key, createdAt: new Date().toISOString() };
+  const packet = { status: 'READY', raw: extractJson(response.text), groundingMetadata: response.groundingMetadata || [], model: response.model, cacheKey: key, createdAt: new Date().toISOString() };
   researchCache.set(key, packet); return packet;
 }
 export async function generateMission({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount, poiTypes = ['AUTO'], customPoiType = '', poisPerOppositionCountry = 0, researchNotes = '', researchLinks = [], backgroundGuideText = '', freezeDate = '', easyLanguage = false, oppositionPriority = false, onProgress, modelSelection }) {
@@ -104,6 +104,12 @@ async function recoverMission({ apiKey, text, ctx, modelSelection, modelInfo }) 
   throw new GeminiError("Gemini returned a response that did not match ChitForge's required format.", { category: 'schema-failure' });
 }
 
+export async function reviewChitsWithResearchPacket({ chits, form, apiKey, primaryModel, modelSelection, onProgress, researchPacket, missionState }) {
+  const mission = { chits, targets: [], metadata: {} };
+  const reviewed = await runFactChecks({ mission, form, apiKey, primaryModel: primaryModel || researchPacket?.model || { id: '' }, modelSelection, onProgress, researchPacket, missionState });
+  return reviewed.chits;
+}
+
 async function runFactChecks({ mission, form, apiKey, primaryModel, modelSelection, onProgress, researchPacket, missionState }) {
   try {
     const prompt = `Return JSON only: {"reviews":[{"id":"poi-1","status":"PASS|NEEDS FIX|FAIL","reason":"short","sourceQuality":"PRIMARY|HIGH|GOOD|LIMITED","trapStrength":"one-liner"}]}.
@@ -111,7 +117,7 @@ Evidence-backed review must use the supplied research packet/source metadata/exc
 MISSION STATE:${JSON.stringify(missionState)}
 AGENDA:${form.agenda}
 PORTFOLIO:${form.portfolio}
-RESEARCH PACKET:${JSON.stringify(researchPacket?.raw || {}).slice(0, 24000)}
+RESEARCH PACKET:${JSON.stringify({ raw: researchPacket?.raw || {}, groundingMetadata: researchPacket?.groundingMetadata || [] }).slice(0, 26000)}
 POIS:${JSON.stringify(mission.chits.map((c, i) => ({ id: c.id || `poi-${i + 1}`, target: c.target, poi: c.poi, pressurePoint: c.pressurePoint, legalFoundation: c.legalFoundation || c.legalPolicyFoundation, evidence: c.evidence })))};`;
     stage(onProgress, 'Review', 'RUNNING', `Batch reviewing ${mission.chits.length} POIs against stored evidence.`, 0, mission.chits.length);
     const res = await callFactCheck(apiKey, prompt, { primaryModelId: primaryModel.id, modelSelection });
@@ -127,7 +133,7 @@ POIS:${JSON.stringify(mission.chits.map((c, i) => ({ id: c.id || `poi-${i + 1}`,
     mission.chits = mission.chits.map((poi) => ({ ...poi, review: { status: 'NEEDS FIX', reason: 'Evidence-backed review unavailable; manual verification required.', sourceQuality: 'LIMITED', trapStrength: 'Not reviewed.' }, factCheck: { status: 'MANUAL VERIFICATION', confidence: 0, claims: [], legalAssessment: { status: 'UNCERTAIN', reason: 'Review unavailable.' }, classificationAssessment: { status: 'UNCERTAIN', reason: 'Review unavailable.' } } }));
     mission.metadata.factCheckModel = 'Unavailable';
   }
-  mission.targets = mission.targets.map((target) => ({ ...target, pois: mission.chits.filter((poi) => poi.target === target.country) }));
+  mission.targets = (mission.targets || []).map((target) => ({ ...target, pois: mission.chits.filter((poi) => poi.target === target.country) }));
   return mission;
 }
 

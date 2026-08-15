@@ -46,12 +46,30 @@ export function WorldMap({ selected, setSelected, portfolio, setPortfolio }) {
     mapGroupRef.current?.setAttribute('transform', `translate(${nextView.x} ${nextView.y}) scale(${nextView.scale})`);
   }, []);
   const isPortfolioCountry = (country) => portfolioText && (country.iso.toLowerCase() === portfolioText || country.name.toLowerCase() === portfolioText);
-  const setAsPortfolio = (country) => { if (dragRef.current.moved) return; setPortfolio?.(country); setSelected(selected.filter((c) => c.iso !== country.iso)); };
+  const setAsPortfolio = (country) => {
+    if (dragRef.current.moved) return;
+    setPortfolio?.(country);
+    setSelected(selected.filter((c) => c.iso !== country.iso));
+  };
   const toggleOpposition = (country) => {
     if (dragRef.current.moved || isPortfolioCountry(country)) return;
     setSelected(selectedIso.has(country.iso) ? selected.filter((c) => c.iso !== country.iso) : [...selected, { iso: country.iso, name: country.name }]);
   };
-  const addInputTarget = () => { const q = targetInput.trim().toLowerCase(); if (!q) return; const country = countries.find((c) => c.iso.toLowerCase() === q || c.name.toLowerCase() === q); if (country && !isPortfolioCountry(country) && !selectedIso.has(country.iso)) setSelected([...selected, { iso: country.iso, name: country.name }]); setTargetInput(''); };
+  const inputTokens = (value) => value.split(/[\n,]+/).flatMap((token) => {
+    const trimmed = token.trim().toLowerCase();
+    if (!trimmed) return [];
+    if (countries.some((c) => c.name.toLowerCase() === trimmed || c.iso.toLowerCase() === trimmed)) return [trimmed];
+    return trimmed.split(/\s+/).filter(Boolean);
+  });
+  const addInputTarget = () => {
+    const next = [...selected];
+    inputTokens(targetInput).forEach((q) => {
+      const country = countries.find((c) => c.iso.toLowerCase() === q || c.name.toLowerCase() === q);
+      if (country && !isPortfolioCountry(country) && !next.some((item) => item.iso === country.iso)) next.push({ iso: country.iso, name: country.name });
+    });
+    setSelected(next.filter((country) => !isPortfolioCountry(country)));
+    setTargetInput('');
+  };
   const moveTooltip = useCallback((event, country) => {
     const { offsetX, offsetY } = event.nativeEvent;
     cancelAnimationFrame(tooltipFrame.current);
@@ -64,7 +82,7 @@ export function WorldMap({ selected, setSelected, portfolio, setPortfolio }) {
 
   const beginPan = useCallback((event) => {
     if (event.button !== undefined && event.button !== 0) return;
-    if (event.target.closest?.('.mapTools')) return;
+    if (event.target.closest?.('.mapTools, .mapTargetInput')) return;
     event.currentTarget.setPointerCapture?.(event.pointerId);
     dragRef.current = { active: true, pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, originX: view.x, originY: view.y, moved: false };
   }, [view.x, view.y]);

@@ -4,7 +4,7 @@ import { createRoot } from 'react-dom/client';
 import './styles.css';
 import { WorldMap } from './map.jsx';
 import { loadStoredKey, saveApiKey, clearStoredKey } from './state.js';
-import { generateFollowUp, generateMission, regenerateChit, lengthInfo } from './generation.js';
+import { captureMissionState, generateFollowUp, generateMission, regenerateChit, lengthInfo, reviewChitsWithResearchPacket, runResearchPacket } from './generation.js';
 import { discoverGeminiModels, refreshModelCapabilities, MODEL_SELECTION_MODES } from './gemini.js';
 import { validateMissionInputs } from './validation.js';
 import { downloadBrief } from './export.js';
@@ -50,6 +50,7 @@ function App() {
   const [manualModelId, setManualModelId] = useState('');
   const [modelCatalog, setModelCatalog] = useState(null);
   const [modelInfo, setModelInfo] = useState(null);
+  const [researchPacket, setResearchPacket] = useState(null);
   const [modelLoading, setModelLoading] = useState(false);
   const [customBackground, setCustomBackground] = useState('');
   const [uiOpacity, setUiOpacity] = useState(100);
@@ -99,11 +100,12 @@ function App() {
     setRecommendations([]);
     try {
       setActivity([]);
-      const result = await generateMission({ form, sliders, selectedTargets: selected, targetingMode: mode, includeFollowUp, poiCount, poisPerOppositionCountry, poiTypes, customPoiType, researchNotes, researchLinks: researchLinksText.split(/\n|,/).map((x) => x.trim()).filter(Boolean), backgroundGuideText, freezeDate, easyLanguage, oppositionPriority, onProgress: pushProgress, modelSelection });
+      const result = await generateMission({ form, sliders, selectedTargets: selected, targetingMode: mode, includeFollowUp, poiCount, poisPerOppositionCountry, poiTypes, customPoiType, researchNotes, researchLinks: researchLinks(), backgroundGuideText, freezeDate, easyLanguage, oppositionPriority, onProgress: pushProgress, modelSelection });
       setPortfolioProfile(result.portfolioProfile);
       setRecommendations(result.recommendedTargets || []);
       setChits(result.chits);
       setModelInfo(result.modelInfo || null);
+      setResearchPacket(result.researchPacket || null);
       if (result.chits.length < poiCount && mode !== 'selected_only') setError({ message: `${result.chits.length} / ${poiCount} POIs generated. Gemini did not return enough distinct, defensible POIs after retry attempts. No duplicates were inserted.` });
       if (!result.chits.length) setError({ message: mode === 'selected_only' && !selected.length ? 'Selected Targets Only needs at least one selected target. Zero selected targets is valid in Selected + Global Research mode.' : 'No defensible targets were discovered. Try Selected + Global Research or refine the agenda.' });
     } catch (err) {
@@ -135,8 +137,29 @@ function App() {
   const copyText = (text) => navigator.clipboard?.writeText(text).catch(() => setError({ message: 'Clipboard access was blocked by the browser.' }));
   const copyAll = () => copyText(chits.map((chit, index) => `POI ${index + 1} — ${chit.target}\n${chit.poi}`).join('\n\n'));
   const copyOpposition = () => copyText(chits.filter((chit) => chit.oppositionTarget).map((chit, index) => `OPPOSITION POI ${index + 1} — ${chit.target}\n${chit.poi}`).join('\n\n'));
-  const runResearchOnly = async () => { setError(null); setBusy(true); try { await generateMission({ form, sliders, selectedTargets: selected, targetingMode: mode, includeFollowUp: false, poiCount: 1, poisPerOppositionCountry: 0, poiTypes: ['AUTO'], researchNotes, researchLinks: researchLinksText.split(/\n|,/).map((x) => x.trim()).filter(Boolean), backgroundGuideText, freezeDate, easyLanguage, oppositionPriority, onProgress: pushProgress, modelSelection }); } catch (err) { showError(err); } finally { setBusy(false); setStatus(null); } };
-  const runReviewCurrent = async () => { setError({ message: 'Review runs automatically during generation using the stored research packet. Regenerate to re-run evidence-backed review on current settings.' }); };
+  const researchLinks = () => researchLinksText.split(/\n|,/).map((x) => x.trim()).filter(Boolean);
+  const missionStateForCurrentUi = () => captureMissionState({ form, sliders, selectedTargets: selected, targetingMode: mode, includeFollowUp, poiCount, poisPerOppositionCountry, poiTypes, customPoiType, researchNotes, researchLinks: researchLinks(), backgroundGuideText, freezeDate, easyLanguage, oppositionPriority, modelSelection });
+  const runResearchOnly = async () => {
+    const validation = validateMissionInputs({ ...form, poiCount: 1 });
+    setError(validation ? { message: validation } : null);
+    if (validation) return;
+    setBusy(true);
+    try {
+      setActivity([]);
+      const packet = await runResearchPacket({ form, missionState: missionStateForCurrentUi(), modelSelection, onProgress: pushProgress });
+      setResearchPacket(packet);
+      setPortfolioProfile(packet.raw?.portfolioProfile || packet.raw?.portfolio_profile || null);
+      setError({ message: `Research packet ready with ${(packet.raw?.pressurePoints || packet.raw?.pressure_points || []).length || 0} retrieved pressure point(s).` });
+    } catch (err) { showError(err); } finally { setBusy(false); setStatus(null); }
+  };
+  const runReviewCurrent = async () => {
+    if (!researchPacket) { setError({ message: 'Run research or generate POIs first so Review has a stored research packet and evidence excerpts.' }); return; }
+    setBusy(true);
+    try {
+      const reviewed = await reviewChitsWithResearchPacket({ chits, form, apiKey: form.apiKey, primaryModel: modelInfo?.model || researchPacket.model, modelSelection, onProgress: pushProgress, researchPacket, missionState: missionStateForCurrentUi() });
+      setChits(reviewed);
+    } catch (err) { showError(err); } finally { setBusy(false); setStatus(null); }
+  };
   const exportBrief = (items = chits) => {
     try { pushProgress({ stage: 'PREPARING DOCX', detail: 'Preparing professional DOCX tactical brief.', done: items.length, total: items.length || 1 }); downloadBrief({ form, sliders, portfolioProfile, chits: items, poiCount, selectedTargets: selected, modelInfo, targetMode: mode }); }
     catch { setError({ message: 'DOCX export failed. Please try again in a modern browser.' }); }
