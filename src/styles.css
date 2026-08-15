@@ -673,3 +673,16 @@ button::after, .backgroundPicker::after, .sourceLink::after {
   opacity: .65;
 }
 .titleCard img { display: none; }
+.mapTargetInput { display: grid; grid-template-columns: 1fr auto; gap: 10px; margin-bottom: 12px; }
+.country.portfolio { fill: rgba(51, 255, 128, .72) !important; stroke: #79ffad !important; stroke-width: 1.2; filter: drop-shadow(0 0 10px rgba(64,255,128,.65)); }
+.country.opposition { fill: rgba(255, 64, 88, .72) !important; stroke: #ff8b9d !important; stroke-width: 1.2; filter: drop-shadow(0 0 10px rgba(255,64,88,.65)); }
+.researchPanel { padding: 14px; display: grid; gap: 12px; margin-bottom: 14px; }
+.researchBuckets { display: flex; flex-wrap: wrap; gap: 8px; }
+.researchBuckets span, .oppositionTag { display: inline-flex; border: 1px solid rgba(255,255,255,.2); border-radius: 999px; padding: 7px 10px; background: rgba(255,255,255,.08); color: var(--text-secondary); font-size: 12px; font-weight: 800; }
+.customTypeField input { border-color: rgba(212,175,55,.44); }
+.oppositionTag { margin-left: 10px; color: #ffd7dd; border-color: rgba(255,95,116,.45); background: rgba(255,60,80,.14); }
+.reviewTooltip { position: relative; display: inline-flex; }
+.reviewTooltip small { display: none; position: absolute; top: 110%; left: 0; width: 260px; padding: 10px; border-radius: 14px; background: rgba(5,7,10,.96); color: var(--text-primary); border: 1px solid rgba(255,255,255,.18); z-index: 5; }
+.reviewTooltip:hover small { display: block; }
+.statusBadge.pass { border-color: rgba(80,255,150,.45); background: rgba(80,255,150,.12); color: #d7ffe5 !important; }
+.statusBadge.needs-fix { border-color: rgba(255,210,90,.45); background: rgba(255,210,90,.12); color: #fff2c2 !important; }

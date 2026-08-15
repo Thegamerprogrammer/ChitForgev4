@@ -14,10 +14,11 @@ import { domainFromUrl } from './sourceValidation.js';
 
 const defaultSliders = { aggression: 0, controversy: 0, diplomacy: 0, length: 0 };
 const modes = [
-  ['selected_global', 'Selected + Global Research', 'Selected countries are primary targets; AI may add stronger agenda-relevant targets.'],
-  ['selected_only', 'Selected Targets Only', 'Use only countries selected on the real world map.'],
+  ['general_auto', 'General / Auto', 'AI maps source-backed global pressure points.'],
+  ['selected_only', 'Selected Opposition Only', 'Use only countries selected as opposition on the real world map.'],
+  ['selected_global', 'Selected Opposition + Global Research', 'Selected opposition is prioritized; grounded research may add stronger targets.'],
 ];
-const progressStages = ['INITIALIZING', 'READING AGENDA', 'ANALYZING PORTFOLIO', 'ANALYZING FOREIGN POLICY', 'MAPPING TARGETS', 'RESEARCHING EVIDENCE', 'ANALYZING LEGAL FRAMEWORKS', 'GENERATING POIs', 'VALIDATING STRUCTURE', 'FACT CHECK PASS 1', 'FACT CHECK PASS 2', 'CALCULATING PRESSURE', 'FINALIZING CHITS', 'PREPARING DOCX'];
+const progressStages = ['Research', 'Reading Agenda/Background/Freeze', 'Portfolio Foreign Policy', 'Mapping Opposition', 'Researching Pressure Points', 'Legal Frameworks', 'Generating Main POIs', 'Per-Opposition POIs', 'Structure + Source Validation', 'Fact Check', 'Review', 'Finalizing'];
 const MemoWorldMap = React.memo(WorldMap);
 
 function App() {
@@ -26,9 +27,17 @@ function App() {
   const [showKey, setShowKey] = useState(false);
   const [sliders, setSliders] = useState(defaultSliders);
   const [poiCount, setPoiCount] = useState(5);
+  const [poisPerOppositionCountry, setPoisPerOppositionCountry] = useState(0);
   const [selected, setSelected] = useState([]);
   const [mode, setMode] = useState('selected_global');
   const [includeFollowUp, setIncludeFollowUp] = useState(false);
+  const [customPoiType, setCustomPoiType] = useState('');
+  const [easyLanguage, setEasyLanguage] = useState(false);
+  const [oppositionPriority, setOppositionPriority] = useState(false);
+  const [researchNotes, setResearchNotes] = useState(() => sessionStorage.getItem('chitforge:researchNotes') || '');
+  const [researchLinksText, setResearchLinksText] = useState('');
+  const [backgroundGuideText, setBackgroundGuideText] = useState('');
+  const [freezeDate, setFreezeDate] = useState(() => sessionStorage.getItem('chitforge:freezeDate') || '');
   const [poiTypes, setPoiTypes] = useState(['AUTO']);
   const [activity, setActivity] = useState([]);
   const [portfolioProfile, setPortfolioProfile] = useState(null);
@@ -56,6 +65,8 @@ function App() {
   }, []);
 
   useEffect(() => () => cancelAnimationFrame(sliderCommitFrame.current), []);
+  useEffect(() => { sessionStorage.setItem('chitforge:researchNotes', researchNotes); }, [researchNotes]);
+  useEffect(() => { sessionStorage.setItem('chitforge:freezeDate', freezeDate); }, [freezeDate]);
 
   const updateForm = (key, value) => {
     const next = { ...form, [key]: value };
@@ -88,7 +99,7 @@ function App() {
     setRecommendations([]);
     try {
       setActivity([]);
-      const result = await generateMission({ form, sliders, selectedTargets: selected, targetingMode: mode, includeFollowUp, poiCount, poiTypes, onProgress: pushProgress, modelSelection });
+      const result = await generateMission({ form, sliders, selectedTargets: selected, targetingMode: mode, includeFollowUp, poiCount, poisPerOppositionCountry, poiTypes, customPoiType, researchNotes, researchLinks: researchLinksText.split(/\n|,/).map((x) => x.trim()).filter(Boolean), backgroundGuideText, freezeDate, easyLanguage, oppositionPriority, onProgress: pushProgress, modelSelection });
       setPortfolioProfile(result.portfolioProfile);
       setRecommendations(result.recommendedTargets || []);
       setChits(result.chits);
@@ -123,6 +134,9 @@ function App() {
 
   const copyText = (text) => navigator.clipboard?.writeText(text).catch(() => setError({ message: 'Clipboard access was blocked by the browser.' }));
   const copyAll = () => copyText(chits.map((chit, index) => `POI ${index + 1} — ${chit.target}\n${chit.poi}`).join('\n\n'));
+  const copyOpposition = () => copyText(chits.filter((chit) => chit.oppositionTarget).map((chit, index) => `OPPOSITION POI ${index + 1} — ${chit.target}\n${chit.poi}`).join('\n\n'));
+  const runResearchOnly = async () => { setError(null); setBusy(true); try { await generateMission({ form, sliders, selectedTargets: selected, targetingMode: mode, includeFollowUp: false, poiCount: 1, poisPerOppositionCountry: 0, poiTypes: ['AUTO'], researchNotes, researchLinks: researchLinksText.split(/\n|,/).map((x) => x.trim()).filter(Boolean), backgroundGuideText, freezeDate, easyLanguage, oppositionPriority, onProgress: pushProgress, modelSelection }); } catch (err) { showError(err); } finally { setBusy(false); setStatus(null); } };
+  const runReviewCurrent = async () => { setError({ message: 'Review runs automatically during generation using the stored research packet. Regenerate to re-run evidence-backed review on current settings.' }); };
   const exportBrief = (items = chits) => {
     try { pushProgress({ stage: 'PREPARING DOCX', detail: 'Preparing professional DOCX tactical brief.', done: items.length, total: items.length || 1 }); downloadBrief({ form, sliders, portfolioProfile, chits: items, poiCount, selectedTargets: selected, modelInfo, targetMode: mode }); }
     catch { setError({ message: 'DOCX export failed. Please try again in a modern browser.' }); }
@@ -163,8 +177,8 @@ function App() {
         </div>
         <h2>Targeting Mode</h2>
         <div className="modes">{modes.map(([id, label, help]) => <label key={id} className="mode"><input type="radio" checked={mode === id} onChange={() => setMode(id)} /> <b>{label}</b><small>{help}</small></label>)}</div>
-        <label>POIs to Generate<input type="number" min="1" max="20" value={poiCount} onChange={(e) => setPoiCount(Math.max(1, Math.min(20, Number(e.target.value) || 1)))} /></label>
-        <label className="check switchField"><input type="checkbox" checked={includeFollowUp} onChange={(e) => setIncludeFollowUp(e.target.checked)} /><span className="glassSwitch" aria-hidden="true"><i /></span><span>Generate Follow-Up</span></label>
+        <label>POIs to Generate<input type="number" min="1" max="100" value={poiCount} onChange={(e) => setPoiCount(Math.max(1, Math.min(100, Number(e.target.value) || 1)))} /></label><label>POIs per opposing country<input type="number" min="0" max="20" value={poisPerOppositionCountry} onChange={(e) => setPoisPerOppositionCountry(Math.max(0, Math.min(20, Number(e.target.value) || 0)))} /></label>
+        <label className="check switchField"><input type="checkbox" checked={easyLanguage} onChange={(e) => setEasyLanguage(e.target.checked)} /><span className="glassSwitch" aria-hidden="true"><i /></span><span>Easy Language</span></label><label className="check switchField"><input type="checkbox" checked={oppositionPriority} onChange={(e) => setOppositionPriority(e.target.checked)} /><span className="glassSwitch" aria-hidden="true"><i /></span><span>Opposition Priority</span></label><label className="check switchField"><input type="checkbox" checked={includeFollowUp} onChange={(e) => setIncludeFollowUp(e.target.checked)} /><span className="glassSwitch" aria-hidden="true"><i /></span><span>Generate Follow-Up</span></label>
         <h2>POI Type</h2>
         <div className="typeGrid" role="group" aria-label="POI type selection">{POI_TYPES.map((type) => <label key={type} className={`typeChip ${poiTypes.includes(type) ? 'active' : ''}`}>
           <input type="checkbox" checked={poiTypes.includes(type)} onChange={() => setPoiTypes((current) => {
@@ -173,18 +187,20 @@ function App() {
             const next = withoutAuto.includes(type) ? withoutAuto.filter((item) => item !== type) : [...withoutAuto, type];
             return next.length ? next : ['AUTO'];
           })} /> {type}
-        </label>)}</div>
+        </label>)}</div>{poiTypes.includes('CUSTOM') && <label className="customTypeField">Custom POI Type<input value={customPoiType} onChange={(e) => setCustomPoiType(e.target.value)} placeholder="Exact classification label" /></label>}
+
+        <h2>Research Mode</h2><div className="researchPanel glass-panel"><label>Research Notes<textarea value={researchNotes} onChange={(e) => setResearchNotes(e.target.value)} placeholder="Optional notes; changes invalidate factual cache." /></label><label>Research Links<textarea value={researchLinksText} onChange={(e) => setResearchLinksText(e.target.value)} placeholder="Optional URLs, one per line." /></label><label>Background Guide<input type="file" accept=".txt,.md,.pdf,.docx" onChange={async (e) => { const file = e.target.files?.[0]; setBackgroundGuideText(file ? await file.text().catch(() => '') : ''); }} /></label><label>Freeze Date<input value={freezeDate} onChange={(e) => setFreezeDate(e.target.value)} placeholder="Optional, e.g. 2026-08-15" /></label><div className="researchBuckets"><span>Scandals / Controversies</span><span>Verified Historical Bad Events</span></div><div className="row"><button type="button" onClick={runResearchOnly} disabled={busy}>Run Research Only</button><button type="button" onClick={runReviewCurrent} disabled={busy || !chits.length}>Run Review on Current POIs</button></div></div>
 
         <div className="notice"><b>TARGETS: OPTIONAL</b><br />{selected.length ? `${selected.length} manual target(s) selected.` : 'GLOBAL RESEARCH ENABLED unless Selected Targets Only is used.'}</div>
         {Object.keys(sliders).map((key) => <GlassRange key={key} name={key} value={sliders[key]} info={key === 'length' ? lengthInfo(sliders.length) : null} onCommit={commitSlider} />)}
         <button className="primary" onClick={runGeneration} disabled={busy}>{busy ? 'Synthesizing Tactical POIs…' : 'Generate Tactical POI Array'}</button>
         {error && <ErrorBox error={error} />}
       </section>
-      <section className="panel mapPanel"><h2>Real World Target Map</h2><MemoWorldMap selected={selected} setSelected={setSelected} portfolio={form.portfolio} /></section>
+      <section className="panel mapPanel"><h2>Real World Target Map</h2><MemoWorldMap selected={selected} setSelected={setSelected} portfolio={form.portfolio} setPortfolio={(country) => updateForm('portfolio', country.name)} /></section>
       <aside className="panel queue glass-sidebar"><details className="settingsPanel" open><summary>Generation Settings</summary><div className="settingsGrid"><span>POI Count<b>{poiCount}</b></span><span>POI Type<b>{poiTypes.join(', ')}</b></span><span>Target Mode<b>{mode}</b></span><span>Follow-ups<b>{includeFollowUp ? 'ON' : 'OFF'}</b></span><span>Model<b>{modelInfo?.model?.displayName || modelMode}</b></span><span>Aggression<b>{sliders.aggression}</b></span><span>Controversy<b>{sliders.controversy}</b></span><span>Diplomacy<b>{sliders.diplomacy}</b></span><span>Length<b>{sliders.length}</b></span></div><GlassRange name="opacity" value={uiOpacity} onCommit={commitOpacity} /></details><h2>Selected Targets</h2>{selected.length ? selected.map((c) => <button key={c.iso} className="pill" onClick={() => setSelected(selected.filter((x) => x.iso !== c.iso))}>{c.name}<span>{c.iso}</span>×</button>) : <p className="muted">No manual targets selected. Auto-discovery can generate anyway.</p>}<button onClick={() => setSelected([])}>Clear selections</button>{recommendations.length > 0 && <><h2>AI Recommended Targets</h2>{recommendations.map((target) => <div className="recommendation" key={`${target.name}-${target.reason}`}><b>{target.name}</b><small>{target.reason}</small></div>)}</>}{(busy || status) && <ProgressPanel status={status} poiCount={poiCount} activity={activity} />}</aside>
     </main>
     {portfolioProfile && <PortfolioIntel profile={portfolioProfile} />}
-    {chits.length > 0 && <section className="poiWindow"><div className="arrayHeader"><div><span className="eyebrow">CHITFORGE</span><h2>TACTICAL POI ARRAY</h2><strong>{chits.length} / {poiCount} POIs GENERATED</strong>{modelInfo?.model && <strong>MODEL: {modelInfo.model.displayName}</strong>}<strong>FACT CHECK: 2-PASS</strong></div><div className="actions"><button onClick={copyAll}>Copy All</button><button onClick={() => exportBrief()}>Download DOCX</button><button onClick={runGeneration} disabled={busy}>Regenerate All</button></div></div><div className="chits">{chits.map((chit, i) => <ChitCard key={`${chit.target}-${i}-${chit.poi}`} chit={chit} number={i + 1} onCopy={copyText} onExport={() => exportBrief([chit])} onFollowUp={() => addFollowUp(i)} onRegenerate={() => regenerateOne(i)} />)}</div></section>}
+    {chits.length > 0 && <section className="poiWindow"><div className="arrayHeader"><div><span className="eyebrow">CHITFORGE</span><h2>TACTICAL POI ARRAY</h2><strong>{chits.length} / {poiCount} POIs GENERATED</strong>{modelInfo?.model && <strong>MODEL: {modelInfo.model.displayName}</strong>}<strong>FACT CHECK: 2-PASS</strong></div><div className="actions"><button onClick={copyAll}>Copy All</button><button onClick={copyOpposition}>Copy All Opposition POIs</button><button onClick={() => exportBrief()}>Download DOCX</button><button onClick={runGeneration} disabled={busy}>Regenerate All</button></div></div><div className="chits">{chits.map((chit, i) => <ChitCard key={`${chit.target}-${i}-${chit.poi}`} chit={chit} number={i + 1} onCopy={copyText} onExport={() => exportBrief([chit])} onFollowUp={() => addFollowUp(i)} onRegenerate={() => regenerateOne(i)} />)}</div></section>}
   </div>;
 }
 
@@ -303,10 +319,10 @@ function ChitCard({ chit, number, onCopy, onFollowUp, onRegenerate }) {
   const full = JSON.stringify(chit, null, 2);
   return <article className="chit glassCard">
     <div className="chitHead"><b>POI #{number}</b><span>{chit.classification || chit.pressureProfile?.classification}</span></div>
-    <p className="targetLine">TARGET: <strong>{chit.target}</strong></p>
+    <p className="targetLine">TARGET: <strong>{chit.target}</strong>{chit.oppositionTarget && <span className="oppositionTag">OPPOSITION TARGET</span>}</p>
     <blockquote className="poiQuestion" dangerouslySetInnerHTML={{ __html: `“${renderMarkdownBold(chit.poi)}”` }} />
     <section className="metrics"><span>{chit.wordCount} WORDS</span><span>{chit.estimatedLines} </span><span>~{chit.estimatedSeconds} SEC</span><span>PRESSURE {chit.pressureScore ?? chit.pressureProfile?.score}/100</span><span>AGGRESSION {chit.pressureProfile?.aggression}%</span><span>CONTROVERSY {chit.pressureProfile?.controversy}%</span><span>DIPLOMACY {chit.pressureProfile?.diplomacy}%</span><span>LENGTH {chit.pressureProfile?.length}%</span></section>
-    <div className="accordion"><details><summary>Legal Foundation</summary><p>{chit.legalFoundation || chit.legalPolicyFoundation}</p></details><details><summary>Evidence & Sources</summary>{(chit.evidence || []).map((e, idx) => <SourceCard source={e} key={`${e.url}-${idx}`} />)}</details><details><summary>Documented Issue</summary><p><b>Portfolio position:</b> {chit.pressurePoint?.portfolioPosition}</p><p><b>Target position/action:</b> {chit.pressurePoint?.targetPositionAction}</p><p><b>Conflict:</b> {chit.pressurePoint?.conflict}</p><p><b>Agenda relevance:</b> {chit.pressurePoint?.agendaRelevance}</p></details><details><summary>Tactical Impact</summary><p>{chit.tacticalImpact}</p><div className="tags">{(chit.legalTacticalTypes || []).map((type) => <span key={type}>{type}</span>)}<span>{chit.classificationReason}</span></div></details><details><summary>Verification</summary><StatusBadge status={chit.factCheck?.status || 'PENDING'} /><p><b>Legal:</b> {chit.factCheck?.legalAssessment?.status || 'UNCERTAIN'} — {chit.factCheck?.legalAssessment?.reason}</p><p><b>Classification:</b> {chit.factCheck?.classificationAssessment?.status || 'UNCERTAIN'} — {chit.factCheck?.classificationAssessment?.reason}</p></details><details open={!!chit.followUp}><summary>Follow-up</summary>{chit.followUp ? <><p><b>Expected evasion:</b> {chit.followUp.expectedEvasion}</p><p><b>Follow-up:</b> {chit.followUp.question}</p></> : <p className="muted">No follow-up generated yet.</p>}</details></div>
+    <div className="accordion"><details><summary>Legal Foundation</summary><p>{chit.legalFoundation || chit.legalPolicyFoundation}</p></details><details><summary>Evidence & Sources</summary>{(chit.evidence || []).map((e, idx) => <SourceCard source={e} key={`${e.url}-${idx}`} />)}</details><details><summary>Documented Issue</summary><p><b>Portfolio position:</b> {chit.pressurePoint?.portfolioPosition}</p><p><b>Target position/action:</b> {chit.pressurePoint?.targetPositionAction}</p><p><b>Conflict:</b> {chit.pressurePoint?.conflict}</p><p><b>Agenda relevance:</b> {chit.pressurePoint?.agendaRelevance}</p></details><details><summary>Tactical Impact</summary><p>{chit.tacticalImpact}</p><div className="tags">{(chit.legalTacticalTypes || []).map((type) => <span key={type}>{type}</span>)}<span>{chit.classificationReason}</span></div></details><details><summary>Verification</summary><span className="reviewTooltip"><StatusBadge status={chit.review?.status || chit.factCheck?.status || 'PENDING'} /><small>{chit.review?.reason || chit.factCheck?.legalAssessment?.reason || 'Review pending.'}</small></span><p><b>Legal:</b> {chit.factCheck?.legalAssessment?.status || 'UNCERTAIN'} — {chit.factCheck?.legalAssessment?.reason}</p><p><b>Classification:</b> {chit.factCheck?.classificationAssessment?.status || 'UNCERTAIN'} — {chit.factCheck?.classificationAssessment?.reason}</p></details><details open={!!chit.followUp}><summary>Follow-up</summary>{chit.followUp ? <><p><b>Expected evasion:</b> {chit.followUp.expectedEvasion}</p><p><b>Follow-up:</b> {chit.followUp.question}</p></> : <p className="muted">No follow-up generated yet.</p>}</details></div>
     <div className="actions"><button onClick={() => onCopy(chit.poi)}>Copy POI</button><button onClick={() => onCopy(full)}>Copy Full</button><button onClick={onRegenerate}>Regenerate</button><button onClick={onFollowUp}>Generate Follow-up</button></div>
   </article>;
 }
