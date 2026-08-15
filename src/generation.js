@@ -1,10 +1,10 @@
-import { callGemini, callFactCheck, repairJsonWithGemini, GeminiError, CHITFORGE_RESPONSE_SCHEMA, FOLLOW_UP_RESPONSE_SCHEMA } from './gemini.js';
+import { callGemini, callFactCheck, repairJsonWithGemini, GeminiError, CHITFORGE_RESPONSE_SCHEMA, FOLLOW_UP_RESPONSE_SCHEMA, geminiInlineDataPart } from './gemini.js';
 import { assertPortfolioSafety, findDuplicatePoiIndexes, INTERNAL_POI_CEILING } from './validation.js';
 import { toInternalMission, validateInternalMission, extractJson } from './responseParser.js';
 import { applyFactCheckToSources, validateSources } from './sourceValidation.js';
 import { planResearchQueries } from './research/planner.js';
 import { searchWithProvider, fetchDocuments } from './research/proxyClient.js';
-import { normalizeEvidence, hasUsablePressurePointEvidence as hasProviderEvidence, RESEARCH_STATUS, buildModelEvidence, compactPressurePointsForModel } from './research/evidence.js';
+import { normalizeEvidence, hasUsablePressurePointEvidence as hasProviderEvidence, RESEARCH_STATUS, buildModelEvidence, compactResearchReferences, compactVerifiedPressurePointReferences } from './research/evidence.js';
 
 export const MASTER_SYSTEM_PROMPT = `You are a ruthless but strictly evidence-based Model United Nations strategist who writes like a sharp floor delegate, not like an AI.
 Write only punchy, natural, spoken-English Points of Information. No robotic phrasing. No academic padding. No ceremonial openings. No “Distinguished Delegate”.
@@ -20,11 +20,11 @@ export const PROGRESS_STAGES = ['Research', 'Reading Agenda/Background/Freeze', 
 const researchCache = new Map();
 const hash = (value) => String(value || '').split('').reduce((a, c) => ((a << 5) - a + c.charCodeAt(0)) | 0, 0).toString(36);
 function stage(onProgress, name, status, detail, done = 0, total = 1) { onProgress?.({ stage: name, status, detail, done, total }); }
-export function captureMissionState({ form, sliders, selectedTargets = [], targetingMode, includeFollowUp, poiCount, poisPerOppositionCountry = 0, poiTypes = ['AUTO'], customPoiType = '', researchNotes = '', researchLinks = [], backgroundGuideText = '', freezeDate = '', easyLanguage = false, oppositionPriority = false, modelSelection = {} }) {
+export function captureMissionState({ form, sliders, selectedTargets = [], targetingMode, includeFollowUp, poiCount, poisPerOppositionCountry = 0, poiTypes = ['AUTO'], customPoiType = '', researchNotes = '', researchLinks = [], backgroundGuideText = '', backgroundGuideFile = null, freezeDate = '', easyLanguage = false, oppositionPriority = false, modelSelection = {} }) {
   const custom = poiTypes.includes('CUSTOM') && customPoiType.trim() ? customPoiType.trim() : '';
-  return Object.freeze({ portfolioCountry: form.portfolio, oppositionCountries: selectedTargets.map((c) => ({ iso: c.iso, name: c.name })), targetMode: targetingMode, totalPois: Math.min(100, Math.max(1, Number(poiCount) || 1)), poisPerOppositionCountry: Math.max(0, Math.min(20, Number(poisPerOppositionCountry) || 0)), aggression: sliders.aggression, controversy: sliders.controversy, diplomacy: sliders.diplomacy, length: sliders.length, poiTypes: custom ? [custom] : poiTypes.filter((t) => t !== 'CUSTOM'), customPoiType: custom, researchNotes, researchLinks: researchLinks.filter(Boolean), backgroundGuideText, freezeDate, easyLanguage, oppositionPriority, includeFollowUp, selectedModel: modelSelection.manualModelId || '', modelMode: modelSelection.modelMode || 'best' });
+  return Object.freeze({ portfolioCountry: form.portfolio, oppositionCountries: selectedTargets.map((c) => ({ iso: c.iso, name: c.name })), targetMode: targetingMode, totalPois: Math.min(100, Math.max(1, Number(poiCount) || 1)), poisPerOppositionCountry: Math.max(0, Math.min(20, Number(poisPerOppositionCountry) || 0)), aggression: sliders.aggression, controversy: sliders.controversy, diplomacy: sliders.diplomacy, length: sliders.length, poiTypes: custom ? [custom] : poiTypes.filter((t) => t !== 'CUSTOM'), customPoiType: custom, researchNotes, researchLinks: researchLinks.filter(Boolean), backgroundGuideText, backgroundGuideFile, freezeDate, easyLanguage, oppositionPriority, includeFollowUp, selectedModel: modelSelection.manualModelId || '', modelMode: modelSelection.modelMode || 'best' });
 }
-function runtimeParams(missionState, targetCountry = '') { return { portfolioCountry: missionState.portfolioCountry, targetCountry, aggression: missionState.aggression, controversy: missionState.controversy, diplomacy: missionState.diplomacy, length: missionState.length, poiType: missionState.poiTypes.join(', '), customPoiType: missionState.customPoiType, easyLanguage: missionState.easyLanguage, freezeDate: missionState.freezeDate, researchNotesPresent: !!missionState.researchNotes, backgroundGuidePresent: !!missionState.backgroundGuideText }; }
+function runtimeParams(missionState, targetCountry = '') { return { portfolioCountry: missionState.portfolioCountry, targetCountry, aggression: missionState.aggression, controversy: missionState.controversy, diplomacy: missionState.diplomacy, length: missionState.length, poiType: missionState.poiTypes.join(', '), customPoiType: missionState.customPoiType, easyLanguage: missionState.easyLanguage, freezeDate: missionState.freezeDate, researchNotesPresent: !!missionState.researchNotes, backgroundGuidePresent: !!(missionState.backgroundGuideFile || missionState.backgroundGuideText) }; }
 function assertRuntime(missionState, supplied) { ['portfolioCountry','aggression','controversy','diplomacy','length','easyLanguage','freezeDate'].forEach((k) => { if (supplied[k] !== missionState[k]) throw new GeminiError(`Runtime parameter assertion failed for ${k}.`, { category: 'runtime-parameter-assertion' }); }); return supplied; }
 
 const scoreNumber = (value, fallback = 50) => { const n = Number(value); return Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : fallback; };
@@ -101,7 +101,7 @@ function keepBest(chits, researchPacket, totalPois) {
   return [...main.sort(sorter).filter((poi) => poi.review?.status === 'PASS').slice(0, totalPois), ...extras.sort(sorter)];
 }
 
-function researchKey(form, missionState) { return JSON.stringify({ agenda: form.agenda, portfolio: missionState.portfolioCountry, freezeDate: missionState.freezeDate, notes: hash(missionState.researchNotes), guide: hash(missionState.backgroundGuideText), links: missionState.researchLinks, targets: missionState.oppositionCountries.map((c) => c.iso || c.name).sort() }); }
+function researchKey(form, missionState) { return JSON.stringify({ agenda: form.agenda, portfolio: missionState.portfolioCountry, freezeDate: missionState.freezeDate, notes: hash(missionState.researchNotes), guide: hash(missionState.backgroundGuideFile?.name || missionState.backgroundGuideText), links: missionState.researchLinks, targets: missionState.oppositionCountries.map((c) => c.iso || c.name).sort() }); }
 export async function runResearchPacket({ form, missionState, modelSelection, onProgress }) {
   const key = researchKey(form, missionState); if (researchCache.has(key)) return researchCache.get(key);
   const params = assertRuntime(missionState, runtimeParams(missionState, missionState.oppositionCountries.map((c) => c.name).join(', ') || 'GLOBAL'));
@@ -149,8 +149,8 @@ Each pressure point needs id,type,target,eventDate,sourceName,organization,publi
   stage(onProgress, 'Researching Pressure Points', packet.status === RESEARCH_STATUS.READY ? 'COMPLETE' : 'FAILED', detail, packet.availableVerifiedPressurePoints.length, Math.max(packet.rankedPressurePoints.length, 1));
   researchCache.set(key, packet); return packet;
 }
-export async function generateMission({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount, poiTypes = ['AUTO'], customPoiType = '', poisPerOppositionCountry = 0, researchNotes = '', researchLinks = [], backgroundGuideText = '', freezeDate = '', easyLanguage = false, oppositionPriority = false, onProgress, modelSelection }) {
-  const missionState = captureMissionState({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount, poisPerOppositionCountry, poiTypes, customPoiType, researchNotes, researchLinks, backgroundGuideText, freezeDate, easyLanguage, oppositionPriority, modelSelection });
+export async function generateMission({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount, poiTypes = ['AUTO'], customPoiType = '', poisPerOppositionCountry = 0, researchNotes = '', researchLinks = [], backgroundGuideText = '', backgroundGuideFile = null, freezeDate = '', easyLanguage = false, oppositionPriority = false, onProgress, modelSelection }) {
+  const missionState = captureMissionState({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount, poisPerOppositionCountry, poiTypes, customPoiType, researchNotes, researchLinks, backgroundGuideText, backgroundGuideFile, freezeDate, easyLanguage, oppositionPriority, modelSelection });
   const oppositionOnly = targetingMode === 'selected_only';
   if (oppositionOnly && !missionState.oppositionCountries.length) throw new GeminiError('Selected Opposition Only needs at least one opposition country. Generation stopped.', { category: 'target-safety' });
   if (missionState.oppositionCountries.some((c) => c.name?.toLowerCase() === missionState.portfolioCountry.toLowerCase() || c.iso?.toLowerCase() === missionState.portfolioCountry.toLowerCase())) throw new GeminiError('Portfolio country cannot also be an opposition target.', { category: 'target-safety' });
@@ -162,8 +162,10 @@ export async function generateMission({ form, sliders, selectedTargets, targetin
   const rankedCandidatePool = candidatePoolFor(researchPacket, missionState.totalPois);
   stage(onProgress, 'Legal Frameworks', 'COMPLETE', `Ranked ${researchPacket.rankedPressurePoints.length} pressure point(s); ${rankedCandidatePool.length} verified candidate(s) eligible for generation.`, rankedCandidatePool.length, Math.max(1, researchPacket.rankedPressurePoints.length));
   const prompt = buildMissionPrompt({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount: missionState.totalPois, poiTypes: missionState.poiTypes, missionState, researchPacket, rankedCandidatePool });
+  const guidePart = geminiInlineDataPart(missionState.backgroundGuideFile);
+  const requestParts = guidePart ? [guidePart] : [];
   const params = assertRuntime(missionState, runtimeParams(missionState, oppositionOnly ? missionState.oppositionCountries.map((c) => c.name).join(', ') : 'GLOBAL/OPPOSITION'));
-  const response = await callGemini(form.apiKey, `${prompt}\nRUNTIME PARAMETER ASSERTION:${JSON.stringify(params)}`, { ...modelSelection, schema: CHITFORGE_RESPONSE_SCHEMA, requestContext: { stage: 'Generating Main POIs', operation: 'main-generation' }, onModelStatus: (status) => onProgress?.({ stage: 'Generating Main POIs', status: 'RUNNING', detail: `Using ${status.model.displayName}.`, done: 0, total: missionState.totalPois }) });
+  const response = await callGemini(form.apiKey, `${prompt}\nRUNTIME PARAMETER ASSERTION:${JSON.stringify(params)}`, { ...modelSelection, requestParts, schema: CHITFORGE_RESPONSE_SCHEMA, requestContext: { stage: 'Generating Main POIs', operation: 'main-generation' }, onModelStatus: (status) => onProgress?.({ stage: 'Generating Main POIs', status: 'RUNNING', detail: `Using ${status.model.displayName}.`, done: 0, total: missionState.totalPois }) });
   let mission = await recoverMission({ apiKey: form.apiKey, text: response.text, ctx: { form, sliders, includeFollowUp, poiCount: missionState.totalPois, targetingMode, poiTypes: missionState.poiTypes, lengthInfo: lengthInfo(sliders.length) }, modelSelection, modelInfo: { primaryModel: response.model.displayName } });
   stage(onProgress, 'Generating Main POIs', 'COMPLETE', `Generated ${mission.chits.length} main candidate POI(s).`, mission.chits.length, missionState.totalPois);
   mission.chits = enforceSafetyAndDiversity(mission.chits.map((poi) => attachPressurePointTrace(poi, researchPacket)), missionState, oppositionOnly).slice(0, INTERNAL_POI_CEILING);
@@ -185,7 +187,8 @@ async function generateOppositionPois({ form, sliders, missionState, researchPac
   missionState.oppositionCountries.forEach((target) => assertPortfolioSafety({ portfolioCountry: missionState.portfolioCountry, targetCountry: target.name, oppositionCountries: missionState.oppositionCountries, oppositionOnly: true }));
   stage(onProgress, 'Per-Opposition POIs', 'RUNNING', `Generating ${missionState.poisPerOppositionCountry} opposition-tagged POIs for each selected opposition target with the shared ranked pool.`, 0, totalOppositionPois);
   const prompt = buildMissionPrompt({ form, sliders, selectedTargets: missionState.oppositionCountries, targetingMode: 'selected_only', includeFollowUp: missionState.includeFollowUp, poiCount: totalOppositionPois, poiTypes: missionState.poiTypes, missionState, researchPacket, rankedCandidatePool }) + `\nGenerate exactly ${missionState.poisPerOppositionCountry} oppositionTarget:true POI(s) per selected target when the ranked pool supports them. These are opposition extras and do not count against the main totalPois budget.`;
-  const res = await callGemini(form.apiKey, prompt, { ...modelSelection, schema: CHITFORGE_RESPONSE_SCHEMA, requestContext: { stage: 'Per-Opposition POIs', operation: 'opposition-generation-shared-pool' } });
+  const guidePart = geminiInlineDataPart(missionState.backgroundGuideFile);
+  const res = await callGemini(form.apiKey, prompt, { ...modelSelection, requestParts: guidePart ? [guidePart] : [], schema: CHITFORGE_RESPONSE_SCHEMA, requestContext: { stage: 'Per-Opposition POIs', operation: 'opposition-generation-shared-pool' } });
   const m = await recoverMission({ apiKey: form.apiKey, text: res.text, ctx: { form, sliders, includeFollowUp: missionState.includeFollowUp, poiCount: totalOppositionPois, targetingMode: 'selected_only', poiTypes: missionState.poiTypes, lengthInfo: lengthInfo(sliders.length) }, modelSelection, modelInfo: { primaryModel: res.model.displayName } });
   return enforceSafetyAndDiversity(m.chits.map((poi) => attachPressurePointTrace(poi, researchPacket)), missionState, true).map((chit) => ({ ...chit, oppositionTarget: true }));
 }
@@ -245,15 +248,15 @@ function buildReviewSupport(chits, researchPacket) {
   const pointIds = new Set((chits || []).map((poi) => poi.pressurePointId).filter(Boolean));
   const points = (researchPacket?.rankedPressurePoints || []).filter((point) => pointIds.has(point.id));
   const evidenceIds = new Set(points.flatMap((point) => point.evidenceIds || []));
-  const evidence = buildModelEvidence((researchPacket?.evidence || []).filter((ev) => evidenceIds.has(ev.id)));
-  return { status: researchPacket?.status, pressurePoints: compactPressurePointsForModel(points, evidence, { maxEvidencePerPoint: 3 }), evidence };
+  const evidence = (researchPacket?.evidence || []).filter((ev) => evidenceIds.has(ev.id));
+  return { status: researchPacket?.status, pressurePoints: compactVerifiedPressurePointReferences(points, evidence), researchReferences: compactResearchReferences(points, evidence) };
 }
 
 async function runFactChecks({ mission, form, apiKey, primaryModel, modelSelection, onProgress, researchPacket, missionState }) {
   try {
     const prompt = `Return JSON only: {"reviews":[{"id":"poi-1","status":"PASS|NEEDS FIX|FAIL","reason":"short","sourceQuality":"PRIMARY|HIGH|GOOD|LIMITED","trapStrength":"one-liner"}]}.
 Evidence-backed review must use the supplied research packet/source metadata/excerpts. Do not decide truth from model memory. PASS only if source evidence supports the POI. Do not perform new full research.
-MISSION STATE:${JSON.stringify(missionState)}
+MISSION STATE:${JSON.stringify({ portfolioCountry: missionState?.portfolioCountry, aggression: missionState?.aggression, controversy: missionState?.controversy, diplomacy: missionState?.diplomacy, length: missionState?.length, freezeDate: missionState?.freezeDate })}
 AGENDA:${form.agenda}
 PORTFOLIO:${form.portfolio}
 RESEARCH SUPPORT:${JSON.stringify(buildReviewSupport(mission.chits, researchPacket))}
@@ -294,8 +297,14 @@ export function buildMissionPrompt({ form, sliders, selectedTargets, targetingMo
 IMMUTABLE MISSION STATE:
 ${missionState ? JSON.stringify(missionState) : 'LEGACY MODE'}
 
-RANKED VERIFIED PRESSURE-POINT CANDIDATE POOL (use only these IDs; sorted best first; do not invent beyond it):
-${rankedCandidatePool ? JSON.stringify(compactPressurePointsForModel(rankedCandidatePool, buildModelEvidence(researchPacket?.evidence || []))) : researchPacket ? JSON.stringify(compactPressurePointsForModel(candidatePoolFor(researchPacket, poiCount), buildModelEvidence(researchPacket?.evidence || []))) : 'No verified pressure-point pool supplied; mark uncertain claims MANUAL VERIFICATION.'}
+BACKGROUND GUIDE:
+${missionState?.backgroundGuideFile ? `Attached once as native Gemini inlineData file/document input (${missionState.backgroundGuideFile.name || 'uploaded guide'}, ${missionState.backgroundGuideFile.mimeType || 'unknown type'}). It is context only, not evidence.` : missionState?.backgroundGuideText ? 'Uploaded guide text is available only as bounded context metadata because no native file bytes were supplied by the UI. It is context only, not evidence.' : 'No background guide supplied.'}
+
+VERIFIED RESEARCH REFERENCES (URL + exact one-line SearXNG result; provenance metadata only, not new factual authority):
+${JSON.stringify(compactResearchReferences(rankedCandidatePool || candidatePoolFor(researchPacket, poiCount), researchPacket?.evidence || []))}
+
+VERIFIED PRESSURE-POINT REFERENCES (sole factual authority for POI content; use only these IDs; sorted best first; do not invent beyond it):
+${JSON.stringify(compactVerifiedPressurePointReferences(rankedCandidatePool || candidatePoolFor(researchPacket, poiCount), researchPacket?.evidence || []))}
 
 COMMITTEE:
 ${form.committee || 'Unspecified'}
@@ -343,9 +352,7 @@ You are an expert competitive Model United Nations strategist.
 
 Analyze the represented country's actual foreign-policy interests in relation to the committee and agenda.
 
-Research credible evidence and relevant international legal frameworks.
-
-Generate concise, simple, hard-hitting POIs.
+Use the attached background guide only as context. Do not quote or treat it as evidence. Do not browse URLs. Generate concise, simple, hard-hitting POIs.
 
 Do not begin with 'Distinguished delegate'.
 
@@ -386,7 +393,7 @@ Do not use ceremonial openings.
 
 Do not add filler.
 
-Every factual statement must be supported by a real source. Do not output 'VERIFICATION REQUIRED' as a source. If a claim cannot be verified, mark it MANUAL VERIFICATION. Never fabricate citations. Never fabricate URLs. Never invent foreign-policy positions. Prefer official government, UN, treaty, IMF, World Bank and other primary sources. Use reputable external reporting where primary sources do not cover the issue.
+Every factual statement must come from one VERIFIED PRESSURE-POINT REFERENCE claim and its verified URLs. Do not output 'VERIFICATION REQUIRED' as a source. If a claim cannot be verified, mark it MANUAL VERIFICATION. Never fabricate citations. Never fabricate URLs. Never invent foreign-policy positions. Prefer official government, UN, treaty, IMF, World Bank and other primary sources. Use reputable external reporting where primary sources do not cover the issue.
 
 For every factual claim used in a POI, provide a real, traceable source. Use the strongest available source. Prefer primary sources: UN documents, official government documents, treaties, court judgments, IMF, World Bank, WTO, OECD, official statistics, and official reports. For controversies and events that primary sources do not adequately cover, use reputable journalism such as Reuters, AP, Financial Times, Bloomberg, BBC, etc. Never fabricate a source. Never fabricate a URL. Never fabricate a publication date. Do not use 'VERIFICATION REQUIRED' as a source. If you cannot establish a claim with a credible source, mark the claim as requiring manual verification instead of inventing evidence.
 
@@ -404,7 +411,7 @@ Use authoritative legal sources where relevant: UN Charter, UNSC resolutions, UN
 
 Use reputable external sources for documented controversies: Reuters, AP, Financial Times, Bloomberg, BBC, Al Jazeera, major established newspapers, credible investigative organizations, academic publications, and established research institutions. Avoid random blogs, unsourced sites, anonymous claims, social media as primary evidence, AI-generated sources, and Wikipedia as primary evidence.
 
-Generate up to ${poiCount} distinct POIs from the ranked candidate pool only. Fewer is acceptable if evidence is thin. Every POI must include pressurePointId copied exactly from one candidate pool item. No duplicates. Each POI should preferably attack a different contradiction, commitment, legal issue, evidence point, implementation failure, policy issue, or financial issue.
+Generate up to ${poiCount} distinct POIs from the verified pressure-point references only. Fewer is acceptable if evidence is thin. Every POI must include pressurePointId copied exactly from one candidate pool item. No duplicates. Each POI should preferably attack a different contradiction, commitment, legal issue, evidence point, implementation failure, policy issue, or financial issue.
 
 Important concepts may be emphasized with Markdown-style bold markers around short phrases only.
 

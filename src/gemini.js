@@ -20,9 +20,10 @@ export function estimateGeminiInputTokens(value) {
   return Math.ceil(text.length / GEMINI_TOKEN_ESTIMATE_CHARS_PER_TOKEN);
 }
 
-export function getGeminiPayloadStats(body, { budget = MAX_GEMINI_INPUT_TOKENS, trimmed = false, requestContext = {} } = {}) {
+export function getGeminiPayloadStats(body, { budget = MAX_GEMINI_INPUT_TOKENS, trimmed = false, requestContext = {}, sdkTokenCount = null } = {}) {
   const serialized = typeof body === 'string' ? body : JSON.stringify(body || '');
-  return { characters: serialized.length, estimatedTokens: estimateGeminiInputTokens(serialized), budget, trimmed: !!trimmed, requestContext: { stage: requestContext.stage || 'unknown', operation: requestContext.operation || 'generateContent' } };
+  const fallbackTokens = estimateGeminiInputTokens(serialized);
+  return { characters: serialized.length, estimatedTokens: Number.isFinite(sdkTokenCount) ? sdkTokenCount : fallbackTokens, fallbackEstimatedTokens: fallbackTokens, usedSdkCountTokens: Number.isFinite(sdkTokenCount), budget, trimmed: !!trimmed, requestContext: { stage: requestContext.stage || 'unknown', operation: requestContext.operation || 'generateContent' } };
 }
 
 function logGeminiBudget(stats) {
@@ -32,8 +33,8 @@ function logGeminiBudget(stats) {
   console.info(`[Gemini] ${label}`, { characters: stats.characters, estimatedTokens: stats.estimatedTokens, budget: stats.budget, trimmed: stats.trimmed, stage: stats.requestContext?.stage });
 }
 
-export function assertGeminiPayloadWithinBudget(body, { requestContext = {}, budget = MAX_GEMINI_INPUT_TOKENS, trimmed = false } = {}) {
-  const stats = getGeminiPayloadStats(body, { budget, trimmed, requestContext });
+export function assertGeminiPayloadWithinBudget(body, { requestContext = {}, budget = MAX_GEMINI_INPUT_TOKENS, trimmed = false, sdkTokenCount = null } = {}) {
+  const stats = getGeminiPayloadStats(body, { budget, trimmed, requestContext, sdkTokenCount });
   logGeminiBudget(stats);
   if (stats.estimatedTokens > budget) {
     throw new GeminiError(`Gemini request too large before send: estimated ${stats.estimatedTokens} input tokens exceeds ChitForge safety budget ${budget}. Reduce agenda/background/evidence payload.`, { category: 'input-budget-exceeded', diagnostic: `REQUEST: ${stats.requestContext.operation}
@@ -45,6 +46,7 @@ BUDGET: ${budget}` });
 }
 
 const endpoint = (_key, id) => `${BASE_URL}/${API_VERSION}/models/${id}:generateContent`;
+const countEndpoint = (_key, id) => `${BASE_URL}/${API_VERSION}/models/${id}:countTokens`;
 const listEndpoint = () => `${BASE_URL}/${API_VERSION}/models`;
 const redact = (value) => value ? `${value.slice(0, 4)}…${value.slice(-4)}` : '';
 const cacheKey = (apiKey) => redact(apiKey);
@@ -78,11 +80,17 @@ export async function discoverGeminiModels(apiKey, { force = false } = {}) {
   return result;
 }
 
-function buildBody(prompt, schema, model, { nativeJson = true } = {}) {
+export function geminiInlineDataPart(file) {
+  if (!file?.base64) return null;
+  return { inlineData: { mimeType: file.mimeType || 'application/octet-stream', data: file.base64 } };
+}
+
+function buildBody(prompt, schema, model, { nativeJson = true, requestParts = [] } = {}) {
   const generationConfig = { temperature: 0.25 };
   if (nativeJson && schema) { generationConfig.responseMimeType = 'application/json'; generationConfig.responseSchema = schema; }
   if (model?.outputTokenLimit) generationConfig.maxOutputTokens = Math.min(8192, Math.max(2048, model.outputTokenLimit));
-  const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig };
+  const parts = [{ text: prompt }, ...requestParts.filter(Boolean)];
+  const body = { contents: [{ role: 'user', parts }], generationConfig };
   return body;
 }
 
@@ -101,11 +109,23 @@ function retryDelayMs(retryAfter, attempt) {
   if (Number.isFinite(dateMs)) return Math.min(30000, Math.max(0, dateMs - Date.now()));
   return Math.min(30000, 1000 * (2 ** Math.max(0, attempt - 1)));
 }
-async function rawGenerate(apiKey, model, prompt, schema, { timeoutMs = 70000, nativeJson = true, requestContext = {}, attempt = 1 } = {}) {
+async function sdkCountTokens(apiKey, model, body, timeoutMs) {
+  const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, 15000));
+  try {
+    const res = await fetch(countEndpoint(apiKey, model.id), { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, signal: controller.signal, body: JSON.stringify({ contents: body.contents, generationConfig: body.generationConfig }) });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const count = Number(data.totalTokens ?? data.total_tokens);
+    return Number.isFinite(count) ? count : null;
+  } catch { return null; } finally { clearTimeout(timer); }
+}
+
+async function rawGenerate(apiKey, model, prompt, schema, { timeoutMs = 70000, nativeJson = true, requestContext = {}, attempt = 1, requestParts = [] } = {}) {
   const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const body = buildBody(prompt, schema, model, { nativeJson });
-    assertGeminiPayloadWithinBudget(body, { requestContext, trimmed: requestContext.trimmed });
+    const body = buildBody(prompt, schema, model, { nativeJson, requestParts });
+    const sdkTokenCount = await sdkCountTokens(apiKey, model, body, timeoutMs);
+    assertGeminiPayloadWithinBudget(body, { requestContext, trimmed: requestContext.trimmed, sdkTokenCount });
     const res = await fetch(endpoint(apiKey, model.id), { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, signal: controller.signal, body: JSON.stringify(body) });
     if (!res.ok) {
       const reason = await parseErrorResponse(res);
@@ -115,7 +135,7 @@ async function rawGenerate(apiKey, model, prompt, schema, { timeoutMs = 70000, n
         record429({ ...requestContext, status: res.status, reason, actualModel: model.displayName, resolvedModel: model.id, requestedModel: requestContext.requestedModel || model.id, retryAfter, attempt, retryDecision: 'retry-after-backoff', cooldownMs });
         clearTimeout(timer);
         await sleep(cooldownMs);
-        return rawGenerate(apiKey, model, prompt, schema, { timeoutMs, nativeJson, requestContext, attempt: attempt + 1 });
+        return rawGenerate(apiKey, model, prompt, schema, { timeoutMs, nativeJson, requestContext, attempt: attempt + 1, requestParts });
       }
       record429({ ...requestContext, status: res.status, reason, actualModel: model.displayName, resolvedModel: model.id, requestedModel: requestContext.requestedModel || model.id, retryAfter, attempt, retryDecision: 'surface-or-fallback' });
       const category = (res.status === 401 || res.status === 403 || /api[_ ]?key|key not valid|API_KEY_INVALID/i.test(reason)) ? 'invalid-api-key' : res.status === 404 ? 'model-unavailable' : [429, 500, 503].includes(res.status) ? 'transient-model-failure' : `http-${res.status}`;
@@ -137,7 +157,7 @@ export function pickModel(models, modelMode, manualModelId) {
   return selectBest(models);
 }
 
-export async function callGemini(apiKey, prompt, { modelMode = MODEL_SELECTION_MODES.BEST, manualModelId, schema = CHITFORGE_RESPONSE_SCHEMA, timeoutMs = 70000, onModelStatus, nativeJson, requestContext = {} } = {}) {
+export async function callGemini(apiKey, prompt, { modelMode = MODEL_SELECTION_MODES.BEST, manualModelId, schema = CHITFORGE_RESPONSE_SCHEMA, timeoutMs = 70000, onModelStatus, nativeJson, requestContext = {}, requestParts = [] } = {}) {
   const discovered = await discoverGeminiModels(apiKey);
   const ranked = discovered.compatible;
   if (!ranked.length) throw new GeminiError('No Gemini text-generation models were returned for this API key. Refresh models or check Gemini API access.', { category: 'no-generation-models' });
@@ -148,11 +168,11 @@ export async function callGemini(apiKey, prompt, { modelMode = MODEL_SELECTION_M
     try {
       try {
         const shouldUseNativeJson = nativeJson ?? true;
-        const generated = await rawGenerate(apiKey, model, prompt, schema, { timeoutMs, nativeJson: shouldUseNativeJson, requestContext });
+        const generated = await rawGenerate(apiKey, model, prompt, schema, { timeoutMs, nativeJson: shouldUseNativeJson, requestContext, requestParts });
         return { ...generated, model, mode: modelMode, fallbackLog, usedNativeJson: shouldUseNativeJson };
       }
       catch (err) {
-        if (err.category === 'http-400') { fallbackLog.push({ from: model.displayName, reason: 'structured-json-request-failed; retried plain JSON' }); { const generated = await rawGenerate(apiKey, model, prompt, schema, { timeoutMs, nativeJson: false, requestContext }); return { ...generated, model, mode: modelMode, fallbackLog, usedNativeJson: false }; } }
+        if (err.category === 'http-400') { fallbackLog.push({ from: model.displayName, reason: 'structured-json-request-failed; retried plain JSON' }); { const generated = await rawGenerate(apiKey, model, prompt, schema, { timeoutMs, nativeJson: false, requestContext, requestParts }); return { ...generated, model, mode: modelMode, fallbackLog, usedNativeJson: false }; } }
         throw err;
       }
     } catch (err) {

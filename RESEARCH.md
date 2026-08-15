@@ -1,78 +1,61 @@
-# ChitForge Research Provider
+# ChitForge research architecture
 
-ChitForge no longer uses Gemini Google Search grounding. Gemini is only used as a query planner and evidence analyst; requests sent through `src/gemini.js` do not include search tools.
+ChitForge separates search/retrieval from Gemini reasoning. Gemini is used only as planner, evidence analyst, generator, fact-checker, and reviewer; active Gemini Google Search grounding/tools are not constructed.
 
-## What SearXNG does
+## Local services
 
-SearXNG is a metasearch engine. ChitForge sends bounded factual search queries to a configured SearXNG JSON API and receives ordinary search results: title, URL, snippet, engine, and originating query.
+Configure local research with:
 
-## Research proxy
-
-This repo is a Vite browser SPA, so the implementation uses a minimal Node HTTP proxy in `proxy/researchProxy.js` instead of adding a large backend framework. The proxy exposes:
-
-- `POST /research/search` — validates/deduplicates up to 12 queries, caps results per query at 10, calls SearXNG `format=json`, and normalizes result objects.
-- `POST /research/fetch` — fetches up to 10 HTTP(S) URLs, blocks localhost/private/link-local/metadata destinations, re-checks DNS and redirects, applies timeouts/size limits, extracts title/text/date where available, and returns explicit `fetchStatus`.
-
-Search and fetch results are cached in memory for the current proxy process. The browser also caches identical search and fetch requests for the current session.
-
-## Local startup
-
-1. Run SearXNG locally with JSON output enabled. One common Docker approach is to use the official SearXNG container or `searxng-docker`, then enable JSON in SearXNG `settings.yml` (`search.formats` includes `json`).
-2. Start the proxy:
-
-```bash
-SEARXNG_BASE_URL=http://localhost:8080 npm run research:proxy
+```env
+RESEARCH_PROXY_PORT=8787
+SEARXNG_BASE_URL=http://localhost:8080
+VITE_RESEARCH_PROXY_URL=http://localhost:8787
 ```
 
-3. Start the SPA pointing at the proxy:
+Self-hosting SearXNG is recommended. The proxy calls the official JSON endpoint (`/search?q=...&format=json`), so the SearXNG instance must enable JSON responses. Public instances can be unreliable and should not be assumed available.
 
-```bash
-VITE_RESEARCH_PROXY_URL=http://localhost:8787 npm run dev
-```
+## Pipeline
 
-## Environment variables
+Mission input flows through:
 
-- `SEARXNG_BASE_URL` — server-side base URL for the SearXNG instance. No default is hardcoded.
-- `RESEARCH_PROXY_PORT` — optional proxy port; default is `8787`.
-- `VITE_RESEARCH_PROXY_URL` — browser-visible URL for the research proxy. No default is hardcoded.
+1. Gemini planner returns 6–12 search queries only; it receives slider values as research-priority signals.
+2. Browser calls the research proxy.
+3. Proxy queries SearXNG and returns real results only: title, URL, snippet, engine, query.
+4. Proxy fetches capped http/https URLs with SSRF protections, timeouts, redirects, and response-size limits.
+5. App normalizes evidence into source-quality, relevance, excerpt, retrieved URL, and fetch status.
+6. Gemini may analyze claims against actual retrieved excerpts, but application code performs the final evidence gate.
+7. Only verified pressure points enter the ranked candidate pool.
+8. Main generation receives a compact payload: mission, generation settings, verified research references, verified pressure-point references, requested `up to N`, and the background guide as a native file/document part when available.
+9. Provenance is preserved as POI → pressurePointId → evidenceIds → retrieved source URL.
+10. Fact-check/review receives only each POI and relevant verified support, not the full research database.
 
-## Evidence chain
+## Evidence rules
 
-The required chain is:
+SearXNG snippets are discovery only. A pressure point is verified only when it has a real search result URL, a successful fetch, usable source text, supported claim status, acceptable source quality, relevance, and freeze-date compliance where a publication date is known.
 
-`pressurePointId -> evidenceId -> SearXNG search result -> retrieved URL -> fetched source content/excerpt -> supported claim`.
+Wikipedia is discovery-only and never qualifies as verified evidence. Failed fetches, missing evidence IDs, snippet-only records, model-invented URLs, and unsupported or partially supported claims are rejected.
 
-A Gemini-generated URL cannot become evidence because analysis output is only accepted when `evidenceIds` resolve to normalized evidence derived from actual SearXNG results and fetched documents. Search snippets alone are kept as discovery material but are not sufficient for `VERIFIED`/`PASS`.
+Source quality is deterministic first:
 
-## Why Gemini Search was removed
+- `PRIMARY`: governments, courts, central banks, international organizations, treaty bodies, official statistics/reports.
+- `SECONDARY`: established journalism and research/academic organizations.
+- `OTHER/REJECT`: blogs, social media, random aggregators, missing/fabricated URLs, Wikipedia, or unusable fetched content.
 
-Gemini Search grounding coupled retrieval and analysis to Gemini-specific `groundingMetadata`. ChitForge now separates retrieval from reasoning so source URLs and excerpts are provider-neutral, auditable, and validated by code before generation/review.
+Serious or materially damaging claims require either one strong primary source or two independent credible sources. The same publisher twice, or duplicate wire coverage, is not independent corroboration.
 
-## Why Wikipedia is rejected
+## Background guide handling
 
-Wikipedia may appear in search results, but it is rejected as verified evidence by deterministic rules. It can be useful for discovery, but ChitForge requires stronger primary, institutional, academic, or established secondary sources for pressure points.
+The uploaded background guide is context only and cannot satisfy the evidence gate. The UI preserves the upload and sends file bytes as a Gemini `inlineData` file/document part when available. Text extraction is retained only as bounded metadata/context for legacy text uploads; the main prompt does not dump the full guide and never treats it as evidence. Unsupported file representations must be converted only through deterministic, bounded, non-AI handling.
 
-## Source-quality limitations
+## Sliders
 
-Source quality uses deterministic domain/content rules first. Primary/institutional domains are strong candidates, established journalism and academic sources are secondary candidates, and anonymous blogs/social sources are weak. Reputation is not treated as claim truth; claim support is separately gated against fetched text and evidence IDs.
+Aggression, Controversy, Diplomacy, and Length affect research-priority allocation and final rhetoric. They never lower source-quality, claim-support, corroboration, freeze-date, or provenance requirements.
 
-## Public vs self-hosted SearXNG
+- Higher controversy prioritizes documented controversies, contradictions, incidents, and commitment gaps when relevant.
+- Higher diplomacy prioritizes official commitments, treaties, votes, negotiations, and diplomatic contradictions.
+- Higher aggression prioritizes hardline policies, confrontational actions, direct clashes, escalation, and coercive measures.
+- Length controls density and legal/hook complexity without exceeding the 6–12 planner-query cap.
 
-Public SearXNG instances may rate-limit, disable JSON output, block automated access, or vary by enabled engines. Self-hosting is recommended for predictable availability and privacy. ChitForge surfaces proxy/SearXNG failures as research-provider errors instead of pretending research succeeded.
+## Token guard
 
-## Limits and caching
-
-- Planner output is capped to 6–12 deduplicated queries.
-- Search results are capped to 10 per query by the proxy.
-- Fetch requests are hard-capped to 10 URLs.
-- Proxy fetches are sequential and bounded by timeout, redirect count, and response size.
-- In-memory caches last only for the current browser session/proxy process.
-- JavaScript-only pages, paywalls, bot blocks, missing publication dates, and ambiguous source reputation may prevent evidence from becoming usable.
-
-## Gemini input budget and compact evidence payloads
-
-ChitForge does not send entire retrieved webpages to Gemini. The research proxy may retrieve bounded source text internally, but the evidence layer converts it to compact model evidence records containing only the evidence ID, title, original URL, domain, source-quality summary, publication date, and bounded extracted excerpt.
-
-All Gemini request paths use an application-level input safety budget below Gemini's provider maximum. The current safety budget is 80,000 estimated input tokens. ChitForge uses a conservative character-based estimate (`Math.ceil(characters / 3.5)`), so the number is approximate rather than an exact tokenizer count.
-
-When evidence is large, ChitForge compacts before the Gemini boundary by deduplicating canonical URLs, dropping duplicate excerpts, trimming individual excerpts, preferring higher-quality/relevant sources, and enforcing a total model-evidence character budget. If the complete Gemini request is still over budget, ChitForge fails locally before sending the request to Gemini.
+ChitForge enforces an 80,000-token application safety budget before every Gemini generation call. It attempts the Gemini `countTokens` endpoint for the actual request (including native file/document parts) and falls back to the local character estimator only when SDK/API counting is unavailable. If the compact final request is still too large, ChitForge blocks locally with `input-budget-exceeded` before calling Gemini.
