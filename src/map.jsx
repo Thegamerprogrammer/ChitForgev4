@@ -55,7 +55,7 @@ export function WorldMap({ selected, setSelected, portfolio, setPortfolio }) {
     if (dragRef.current.moved || isPortfolioCountry(country)) return;
     setSelected(selectedIso.has(country.iso) ? selected.filter((c) => c.iso !== country.iso) : [...selected, { iso: country.iso, name: country.name }]);
   };
-  const inputTokens = (value) => value.split(/[\n,]+/).flatMap((token) => {
+  const inputTokens = (value) => value.split(/[\n,;]+/).flatMap((token) => {
     const trimmed = token.trim().toLowerCase();
     if (!trimmed) return [];
     if (countries.some((c) => c.name.toLowerCase() === trimmed || c.iso.toLowerCase() === trimmed)) return [trimmed];

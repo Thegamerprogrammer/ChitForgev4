@@ -13,13 +13,14 @@
   "dependencies": {
     "@google/genai": "^2.16.0",
     "@vitejs/plugin-react": "latest",
-    "d3-geo": "latest",
+    "d3-array": "^3.2.4",
+    "d3-geo": "^3.1.1",
     "docx": "^9.7.1",
     "react": "latest",
     "react-dom": "latest",
-    "topojson-client": "latest",
+    "topojson-client": "^3.1.0",
     "vite": "latest",
-    "world-atlas": "latest",
+    "world-atlas": "^2.0.2",
     "world-countries": "^5.1.0",
     "zod": "^4.4.3"
   },
