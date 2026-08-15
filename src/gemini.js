@@ -45,13 +45,11 @@ export async function discoverGeminiModels(apiKey, { force = false } = {}) {
   return result;
 }
 
-function buildBody(prompt, schema, model, { nativeJson = true, useGoogleSearch = false, searchToolName = 'googleSearch' } = {}) {
+function buildBody(prompt, schema, model, { nativeJson = true } = {}) {
   const generationConfig = { temperature: 0.25 };
   if (nativeJson && schema) { generationConfig.responseMimeType = 'application/json'; generationConfig.responseSchema = schema; }
   if (model?.outputTokenLimit) generationConfig.maxOutputTokens = Math.min(8192, Math.max(2048, model.outputTokenLimit));
   const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig };
-  // Gemini API v1beta current Search grounding tool. Older models may reject it; research calls surface that as unavailable instead of silently falling back to pretrained knowledge.
-  if (useGoogleSearch) body.tools = [{ [searchToolName]: {} }];
   return body;
 }
 
@@ -70,11 +68,10 @@ function retryDelayMs(retryAfter, attempt) {
   if (Number.isFinite(dateMs)) return Math.min(30000, Math.max(0, dateMs - Date.now()));
   return Math.min(30000, 1000 * (2 ** Math.max(0, attempt - 1)));
 }
-function groundingMetadataFrom(data) { return (data.candidates || []).flatMap((candidate) => candidate.groundingMetadata ? [candidate.groundingMetadata] : []); }
-async function rawGenerate(apiKey, model, prompt, schema, { timeoutMs = 70000, nativeJson = true, useGoogleSearch = false, searchToolName = 'googleSearch', requestContext = {}, attempt = 1 } = {}) {
+async function rawGenerate(apiKey, model, prompt, schema, { timeoutMs = 70000, nativeJson = true, requestContext = {}, attempt = 1 } = {}) {
   const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(endpoint(apiKey, model.id), { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, signal: controller.signal, body: JSON.stringify(buildBody(prompt, schema, model, { nativeJson, useGoogleSearch, searchToolName })) });
+    const res = await fetch(endpoint(apiKey, model.id), { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, signal: controller.signal, body: JSON.stringify(buildBody(prompt, schema, model, { nativeJson })) });
     if (!res.ok) {
       const reason = await parseErrorResponse(res);
       const retryAfter = res.headers.get('retry-after') || '';
@@ -83,19 +80,17 @@ async function rawGenerate(apiKey, model, prompt, schema, { timeoutMs = 70000, n
         record429({ ...requestContext, status: res.status, reason, actualModel: model.displayName, resolvedModel: model.id, requestedModel: requestContext.requestedModel || model.id, retryAfter, attempt, retryDecision: 'retry-after-backoff', cooldownMs });
         clearTimeout(timer);
         await sleep(cooldownMs);
-        return rawGenerate(apiKey, model, prompt, schema, { timeoutMs, nativeJson, useGoogleSearch, searchToolName, requestContext, attempt: attempt + 1 });
+        return rawGenerate(apiKey, model, prompt, schema, { timeoutMs, nativeJson, requestContext, attempt: attempt + 1 });
       }
       record429({ ...requestContext, status: res.status, reason, actualModel: model.displayName, resolvedModel: model.id, requestedModel: requestContext.requestedModel || model.id, retryAfter, attempt, retryDecision: 'surface-or-fallback' });
-      const category = useGoogleSearch && (res.status === 400 || res.status === 404) ? 'grounding-unavailable' : (res.status === 401 || res.status === 403 || /api[_ ]?key|key not valid|API_KEY_INVALID/i.test(reason)) ? 'invalid-api-key' : res.status === 404 ? 'model-unavailable' : [429, 500, 503].includes(res.status) ? 'transient-model-failure' : `http-${res.status}`;
-      throw new GeminiError(useGoogleSearch && category === 'grounding-unavailable' ? 'RESEARCH UNAVAILABLE: Gemini Google Search grounding is unavailable for this model/request. Manual verification required.' : userMessageForStatus(res.status, reason), { category, status: res.status, reason, model: model.displayName });
+      const category = (res.status === 401 || res.status === 403 || /api[_ ]?key|key not valid|API_KEY_INVALID/i.test(reason)) ? 'invalid-api-key' : res.status === 404 ? 'model-unavailable' : [429, 500, 503].includes(res.status) ? 'transient-model-failure' : `http-${res.status}`;
+      throw new GeminiError(userMessageForStatus(res.status, reason), { category, status: res.status, reason, model: model.displayName });
     }
     const data = await res.json();
     if (data.promptFeedback?.blockReason) throw new GeminiError(`Gemini blocked the request for safety reasons: ${data.promptFeedback.blockReason}.`, { category: 'safety-filter', reason: data.promptFeedback.blockReason, model: model.displayName });
     const text = extractGeminiText(data).trim();
     if (!text) throw new GeminiError('Gemini returned an empty response. Try generating again.', { category: 'empty-response', model: model.displayName, diagnostic: import.meta.env.DEV ? `MODEL: ${model.displayName}\nHTTP STATUS: ${res.status}\nRAW RESPONSE LENGTH: ${JSON.stringify(data).length}\nEXTRACTED TEXT LENGTH: 0` : undefined });
-    const groundingMetadata = groundingMetadataFrom(data);
-    if (useGoogleSearch && !groundingMetadata.length) throw new GeminiError('RESEARCH UNAVAILABLE: Gemini returned no grounding metadata. Manual verification required.', { category: 'grounding-metadata-missing', model: model.displayName });
-    return { text, groundingMetadata, raw: data };
+    return { text, raw: data };
   } catch (error) { if (error instanceof GeminiError) throw error; if (error.name === 'AbortError') throw new GeminiError('Request timed out.', { category: 'timeout', cause: error, model: model.displayName }); throw new GeminiError('Could not reach Gemini.', { category: 'network', cause: error, model: model.displayName }); } finally { clearTimeout(timer); }
 }
 
@@ -107,7 +102,7 @@ export function pickModel(models, modelMode, manualModelId) {
   return selectBest(models);
 }
 
-export async function callGemini(apiKey, prompt, { modelMode = MODEL_SELECTION_MODES.BEST, manualModelId, schema = CHITFORGE_RESPONSE_SCHEMA, timeoutMs = 70000, onModelStatus, useGoogleSearch = false, nativeJson, requestContext = {} } = {}) {
+export async function callGemini(apiKey, prompt, { modelMode = MODEL_SELECTION_MODES.BEST, manualModelId, schema = CHITFORGE_RESPONSE_SCHEMA, timeoutMs = 70000, onModelStatus, nativeJson, requestContext = {} } = {}) {
   const discovered = await discoverGeminiModels(apiKey);
   const ranked = discovered.compatible;
   if (!ranked.length) throw new GeminiError('No Gemini text-generation models were returned for this API key. Refresh models or check Gemini API access.', { category: 'no-generation-models' });
@@ -117,28 +112,17 @@ export async function callGemini(apiKey, prompt, { modelMode = MODEL_SELECTION_M
     onModelStatus?.({ model, mode: modelMode, fallbackLog });
     try {
       try {
-        const shouldUseNativeJson = useGoogleSearch ? false : nativeJson ?? true;
-        const activeSchema = useGoogleSearch ? undefined : schema;
-        try {
-          const generated = await rawGenerate(apiKey, model, prompt, activeSchema, { timeoutMs, nativeJson: shouldUseNativeJson, useGoogleSearch, searchToolName: 'googleSearch', requestContext });
-          return { ...generated, model, mode: modelMode, fallbackLog, usedNativeJson: shouldUseNativeJson };
-        } catch (err) {
-          if (useGoogleSearch && err.category === 'grounding-unavailable') {
-            fallbackLog.push({ from: model.displayName, reason: 'googleSearch rejected; retried google_search' });
-            const generated = await rawGenerate(apiKey, model, prompt, undefined, { timeoutMs, nativeJson: false, useGoogleSearch, searchToolName: 'google_search', requestContext });
-            return { ...generated, model, mode: modelMode, fallbackLog, usedNativeJson: false };
-          }
-          throw err;
-        }
+        const shouldUseNativeJson = nativeJson ?? true;
+        const generated = await rawGenerate(apiKey, model, prompt, schema, { timeoutMs, nativeJson: shouldUseNativeJson, requestContext });
+        return { ...generated, model, mode: modelMode, fallbackLog, usedNativeJson: shouldUseNativeJson };
       }
       catch (err) {
-        if (!useGoogleSearch && err.category === 'http-400') { fallbackLog.push({ from: model.displayName, reason: 'structured-json-request-failed; retried plain JSON' }); { const generated = await rawGenerate(apiKey, model, prompt, schema, { timeoutMs, nativeJson: false, useGoogleSearch, requestContext }); return { ...generated, model, mode: modelMode, fallbackLog, usedNativeJson: false }; } }
+        if (err.category === 'http-400') { fallbackLog.push({ from: model.displayName, reason: 'structured-json-request-failed; retried plain JSON' }); { const generated = await rawGenerate(apiKey, model, prompt, schema, { timeoutMs, nativeJson: false, requestContext }); return { ...generated, model, mode: modelMode, fallbackLog, usedNativeJson: false }; } }
         throw err;
       }
     } catch (err) {
       if (err.category === 'invalid-api-key') throw err;
-      if (!useGoogleSearch && (err.category === 'grounding-unavailable' || err.category === 'grounding-metadata-missing')) throw err;
-      if (!['model-unavailable', 'transient-model-failure', 'timeout', 'network', 'grounding-unavailable', 'grounding-metadata-missing'].includes(err.category)) throw err;
+      if (!['model-unavailable', 'transient-model-failure', 'timeout', 'network'].includes(err.category)) throw err;
       fallbackLog.push({ from: model.displayName, reason: err.status || err.category });
     }
   }
