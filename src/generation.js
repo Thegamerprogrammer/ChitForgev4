@@ -2,6 +2,9 @@ import { callGemini, callFactCheck, repairJsonWithGemini, GeminiError, CHITFORGE
 import { assertPortfolioSafety, findDuplicatePoiIndexes, INTERNAL_POI_CEILING } from './validation.js';
 import { toInternalMission, validateInternalMission, extractJson } from './responseParser.js';
 import { applyFactCheckToSources, validateSources } from './sourceValidation.js';
+import { planResearchQueries } from './research/planner.js';
+import { searchWithProvider, fetchDocuments } from './research/proxyClient.js';
+import { normalizeEvidence, hasUsablePressurePointEvidence as hasProviderEvidence, RESEARCH_STATUS, buildModelEvidence, compactPressurePointsForModel } from './research/evidence.js';
 
 export const MASTER_SYSTEM_PROMPT = `You are a ruthless but strictly evidence-based Model United Nations strategist who writes like a sharp floor delegate, not like an AI.
 Write only punchy, natural, spoken-English Points of Information. No robotic phrasing. No academic padding. No ceremonial openings. No “Distinguished Delegate”.
@@ -28,27 +31,16 @@ const scoreNumber = (value, fallback = 50) => { const n = Number(value); return 
 const sourceUrl = (point) => point.url || point.sourceUrl || point.source_url || point.source?.url || point.evidence?.[0]?.url || point.sources?.[0]?.url || '';
 const pointEvidence = (point) => String(point.evidenceExcerpt || point.evidence_excerpt || point.excerpt || point.claim || point.claimSupported || point.evidence?.[0]?.claim || point.sources?.[0]?.claim || '').trim();
 const hasRealUrl = (value) => /^https?:\/\//i.test(String(value || '')) && !/example\.com|wikipedia\.org/i.test(String(value || ''));
-const hasUsableGrounding = (metadata) => Array.isArray(metadata) && metadata.some((m) => {
-  const chunks = m.groundingChunks || m.grounding_chunks || [];
-  const queries = m.webSearchQueries || [];
-  return chunks.length > 0 || queries.length > 0 || !!m.searchEntryPoint;
-});
-function groundingUrls(metadata) {
-  return new Set((metadata || []).flatMap((m) => (m.groundingChunks || m.grounding_chunks || []).map((chunk) => chunk.web?.uri || chunk.retrievedContext?.uri || chunk.uri || chunk.url).filter(Boolean)));
-}
-function hasUsablePressurePointEvidence(point, retrievedUrls = null) {
-  const url = sourceUrl(point);
-  const status = String(point.verificationStatus || point.status || '').toUpperCase();
-  const hasEvidenceText = pointEvidence(point).length >= 20;
-  const isRetrieved = !retrievedUrls || (hasRealUrl(url) && retrievedUrls.has(url));
-  return isRetrieved && (hasRealUrl(url) || hasEvidenceText) && !/MANUAL VERIFICATION|UNVERIFIED|GARBAGE|RESEARCH UNAVAILABLE/.test(status);
-}
-function normalizePressurePoints(rawPoints = [], missionState = {}, groundingMetadata = []) {
-  const grounding = hasUsableGrounding(groundingMetadata);
-  const retrievedUrls = groundingUrls(groundingMetadata);
+function evidenceMap(evidence = []) { return new Map(evidence.map((ev) => [ev.id, ev])); }
+function hasUsablePressurePointEvidence(point, evidenceById = new Map(), missionState = {}) { return hasProviderEvidence(point, evidenceById, missionState); }
+export function normalizePressurePoints(rawPoints = [], missionState = {}, evidence = []) {
+  const byId = evidenceMap(evidence);
   return rawPoints.map((point, index) => {
     const id = String(point.id || point.pressurePointId || point.pressure_point_id || `pp-${String(index + 1).padStart(3, '0')}`).trim();
-    const evidenceStrength = hasUsablePressurePointEvidence(point, retrievedUrls) ? (grounding ? 95 : 75) : 10;
+    const ids = Array.isArray(point.evidenceIds) ? point.evidenceIds.filter((evId) => byId.has(evId)) : [];
+    const firstEvidence = ids.map((evId) => byId.get(evId)).find(Boolean);
+    const usable = hasUsablePressurePointEvidence({ ...point, evidenceIds: ids }, byId, missionState);
+    const evidenceStrength = usable ? Math.max(75, firstEvidence?.sourceQuality?.score || 75) : 10;
     const scores = {
       agendaRelevance: scoreNumber(point.agendaRelevance ?? point.agenda_relevance ?? point.scores?.agendaRelevance, 55),
       evidenceStrength: scoreNumber(point.evidenceStrength ?? point.evidence_strength ?? point.scores?.evidenceStrength, evidenceStrength),
@@ -58,18 +50,16 @@ function normalizePressurePoints(rawPoints = [], missionState = {}, groundingMet
       uniqueness: 70,
     };
     const rankScore = Math.round(scores.agendaRelevance * 0.22 + scores.evidenceStrength * 0.28 + scores.portfolioAlignment * 0.17 + scores.controversyFit * 0.12 + scores.legalHookPotential * 0.14 + scores.uniqueness * 0.07);
-    return { id, rank: index + 1, rankScore, type: point.type || 'EVIDENCE TRAP', target: point.target || point.country || '', eventDate: point.eventDate || point.event_date || '', sourceName: point.sourceName || point.source_name || point.source || '', organization: point.organization || '', url: sourceUrl(point), publicationDate: point.publicationDate || point.publication_date || '', claim: point.claim || '', evidenceExcerpt: pointEvidence(point), verificationStatus: point.verificationStatus || point.status || '', scores, usableForGeneration: hasUsablePressurePointEvidence(point, retrievedUrls), raw: point };
+    return { id, rank: index + 1, rankScore, type: point.type || 'EVIDENCE TRAP', target: point.target || point.country || '', eventDate: point.eventDate || point.event_date || '', sourceName: point.sourceName || firstEvidence?.title || '', organization: point.organization || firstEvidence?.domain || '', url: firstEvidence?.url || sourceUrl(point), publicationDate: point.publicationDate || firstEvidence?.publishedAt || '', claim: point.claim || '', evidenceExcerpt: pointEvidence(point) || firstEvidence?.excerpt || '', evidenceIds: ids, verificationStatus: usable ? 'VERIFIED' : (point.verificationStatus || point.status || 'NOT VERIFIED'), scores, usableForGeneration: usable, raw: point };
   }).sort((a, b) => b.rankScore - a.rankScore || a.id.localeCompare(b.id)).map((point, index) => ({ ...point, rank: index + 1 }));
 }
-function deriveResearchPacket(raw, groundingMetadata, missionState) {
+export function deriveResearchPacket(raw, evidence, missionState, providerStatus = RESEARCH_STATUS.NO_USABLE_EVIDENCE) {
+  if (providerStatus === RESEARCH_STATUS.UNAVAILABLE) return { status: RESEARCH_STATUS.UNAVAILABLE, rankedPressurePoints: [], availableVerifiedPressurePoints: [], candidatePoolSize: 0, evidence, raw: { ...(raw || {}), status: RESEARCH_STATUS.UNAVAILABLE, pressurePoints: [], evidence } };
   const sourcePoints = Array.isArray(raw?.pressurePoints) ? raw.pressurePoints : Array.isArray(raw?.pressure_points) ? raw.pressure_points : [];
-  const rankedPressurePoints = normalizePressurePoints(sourcePoints, missionState, groundingMetadata);
+  const rankedPressurePoints = normalizePressurePoints(sourcePoints, missionState, evidence);
   const availableVerifiedPressurePoints = rankedPressurePoints.filter((point) => point.usableForGeneration);
-  const hasGrounding = hasUsableGrounding(groundingMetadata);
-  const retrievedUrls = groundingUrls(groundingMetadata);
-  const hasSourceBackedPoint = availableVerifiedPressurePoints.some((point) => hasRealUrl(point.url) && retrievedUrls.has(point.url) && point.evidenceExcerpt.length >= 20);
-  const status = availableVerifiedPressurePoints.length && (hasGrounding || hasSourceBackedPoint) ? 'READY' : 'RESEARCH UNAVAILABLE';
-  return { status, rankedPressurePoints, availableVerifiedPressurePoints, candidatePoolSize: 0, raw: { ...raw, status, pressurePoints: rankedPressurePoints } };
+  const status = availableVerifiedPressurePoints.length ? RESEARCH_STATUS.READY : RESEARCH_STATUS.NO_USABLE_EVIDENCE;
+  return { status, rankedPressurePoints, availableVerifiedPressurePoints, candidatePoolSize: 0, evidence, raw: { ...raw, status, pressurePoints: rankedPressurePoints, evidence } };
 }
 function candidatePoolFor(researchPacket, totalPois) {
   const available = researchPacket?.availableVerifiedPressurePoints || [];
@@ -82,10 +72,12 @@ function setCandidatePoolSize(researchPacket, totalPois) {
   return candidatePoolSize;
 }
 function packetPointById(researchPacket, id) { return (researchPacket?.rankedPressurePoints || []).find((point) => point.id === id); }
-function hasPacketSupportForPoi(poi, point) {
-  if (!point || !hasUsablePressurePointEvidence(point)) return false;
-  const poiEvidenceHasPointUrl = (poi.evidence || []).some((source) => hasRealUrl(source.url || source.source_url) && hasRealUrl(point.url) && (source.url || source.source_url) === point.url);
-  return hasRealUrl(point.url) && point.evidenceExcerpt.length >= 20 && (poiEvidenceHasPointUrl || (poi.evidence || []).some((source) => hasRealUrl(source.url || source.source_url)));
+function hasPacketSupportForPoi(poi, point, researchPacket) {
+  const evidenceById = evidenceMap(researchPacket?.evidence || []);
+  if (!point || !hasUsablePressurePointEvidence(point, evidenceById, researchPacket?.missionState || {})) return false;
+  const allowedUrls = new Set((point.evidenceIds || []).map((id) => evidenceById.get(id)?.url).filter(hasRealUrl));
+  const poiEvidenceHasBoundUrl = (poi.evidence || []).some((source) => allowedUrls.has(source.url || source.source_url));
+  return point.evidenceExcerpt.length >= 20 && poiEvidenceHasBoundUrl;
 }
 function attachPressurePointTrace(chit, researchPacket) {
   const point = packetPointById(researchPacket, chit.pressurePointId);
@@ -112,23 +104,49 @@ function keepBest(chits, researchPacket, totalPois) {
 function researchKey(form, missionState) { return JSON.stringify({ agenda: form.agenda, portfolio: missionState.portfolioCountry, freezeDate: missionState.freezeDate, notes: hash(missionState.researchNotes), guide: hash(missionState.backgroundGuideText), links: missionState.researchLinks, targets: missionState.oppositionCountries.map((c) => c.iso || c.name).sort() }); }
 export async function runResearchPacket({ form, missionState, modelSelection, onProgress }) {
   const key = researchKey(form, missionState); if (researchCache.has(key)) return researchCache.get(key);
-  stage(onProgress, 'Researching Pressure Points', 'RUNNING', 'Using Gemini Google Search grounding to retrieve source-backed pressure points.', 0, Math.max(1, missionState.totalPois));
   const params = assertRuntime(missionState, runtimeParams(missionState, missionState.oppositionCountries.map((c) => c.name).join(', ') || 'GLOBAL'));
-  const retrievalPrompt = `${MASTER_SYSTEM_PROMPT}\nRetrieve source-backed research notes using Google Search grounding. Do not return JSON. Do not use pretrained memory as evidence. If retrieval is unavailable say RESEARCH UNAVAILABLE.\nRUNTIME PARAMETERS: ${JSON.stringify(params)}\nCOMMITTEE:${form.committee}\nAGENDA:${form.agenda}\nPORTFOLIO:${missionState.portfolioCountry}\nTARGETS:${JSON.stringify(missionState.oppositionCountries)}\nRESEARCH NOTES:${missionState.researchNotes}\nRESEARCH LINKS:${missionState.researchLinks.join('\n')}\nBACKGROUND GUIDE:${missionState.backgroundGuideText.slice(0,8000)}\nFREEZE DATE:${missionState.freezeDate}\nFind scandals/controversies and verified historical bad events separately. Capture source names, organizations, URLs, dates, claims, and short evidence excerpts.`;
-  let retrieval;
+  stage(onProgress, 'Researching Pressure Points', 'RUNNING', 'Planning bounded SearXNG research queries without Gemini Search tools.', 0, Math.max(1, missionState.totalPois));
+  let planned, searchPacket, documents, evidence;
   try {
-    retrieval = await callGemini(form.apiKey, retrievalPrompt, { ...modelSelection, schema: null, nativeJson: false, useGoogleSearch: true, requestContext: { stage: 'Researching Pressure Points', operation: 'grounded-research-retrieve' } });
+    planned = await planResearchQueries({ form, missionState: { ...missionState, committee: form.committee, agenda: form.agenda }, modelSelection });
+    stage(onProgress, 'Researching Pressure Points', 'RUNNING', `Searching SearXNG with ${planned.queries.length} deduplicated querie(s).`, 1, Math.max(1, planned.queries.length));
+    searchPacket = await searchWithProvider(planned.queries, { maxResultsPerQuery: 8 });
+    const urls = searchPacket.results.map((r) => r.url).filter((url) => !/wikipedia\.org/i.test(url)).slice(0, 10);
+    stage(onProgress, 'Researching Pressure Points', 'RUNNING', `Fetching ${urls.length} selected source page(s).`, 0, Math.max(1, urls.length));
+    documents = await fetchDocuments(urls);
+    evidence = normalizeEvidence({ results: searchPacket.results, documents, missionState: { ...missionState, committee: form.committee, agenda: form.agenda }, provider: searchPacket.provider });
   } catch (error) {
-    const packet = { status: 'RESEARCH UNAVAILABLE', raw: { status: 'RESEARCH UNAVAILABLE', pressurePoints: [], warning: error.message }, rankedPressurePoints: [], availableVerifiedPressurePoints: [], candidatePoolSize: 0, groundingMetadata: [], model: error.model || null, cacheKey: key, createdAt: new Date().toISOString() };
-    stage(onProgress, 'Researching Pressure Points', 'FAILED', 'RESEARCH UNAVAILABLE: Gemini Search grounding failed; manual verification required.', 0, 1);
+    const message = error.category === 'searxng-unavailable' ? 'SearXNG unavailable' : 'Research proxy unavailable';
+    const packet = { status: RESEARCH_STATUS.UNAVAILABLE, raw: { status: RESEARCH_STATUS.UNAVAILABLE, pressurePoints: [], warning: message, providerError: error.message }, rankedPressurePoints: [], availableVerifiedPressurePoints: [], candidatePoolSize: 0, evidence: [], model: null, cacheKey: key, createdAt: new Date().toISOString() };
+    stage(onProgress, 'Researching Pressure Points', 'FAILED', `${message}: ${error.message}`, 0, 1);
     researchCache.set(key, packet); return packet;
   }
-  const structurePrompt = `${MASTER_SYSTEM_PROMPT}\nReturn JSON only. Convert the grounded retrieval notes and grounding metadata below into a research packet with portfolioProfile and pressurePoints[]. Do not add facts, URLs, sources, dates, or claims that are not present in RETRIEVED NOTES or GROUNDING METADATA. Mark uncertain items MANUAL VERIFICATION.\nEach pressure point needs id,type,target,eventDate,sourceName,organization,url,publicationDate,claim,evidenceExcerpt,agendaRelevance,portfolioRelevance,legalRelevance,verificationStatus.\nRUNTIME PARAMETERS:${JSON.stringify(params)}\nRETRIEVED NOTES:\n${retrieval.text}\nGROUNDING METADATA:\n${JSON.stringify(retrieval.groundingMetadata || []).slice(0, 16000)}`;
-  const structured = await callGemini(form.apiKey, structurePrompt, { ...modelSelection, schema: null, useGoogleSearch: false, requestContext: { stage: 'Researching Pressure Points', operation: 'grounded-research-structure' } });
-  const derived = deriveResearchPacket(extractJson(structured.text), retrieval.groundingMetadata || [], missionState);
-  const packet = { ...derived, groundingMetadata: retrieval.groundingMetadata || [], model: structured.model, retrievalModel: retrieval.model, cacheKey: key, createdAt: new Date().toISOString() };
+  const modelEvidence = buildModelEvidence(evidence);
+  const analysisPayload = { runtimeParameters: params, committee: form.committee, agenda: form.agenda, portfolio: missionState.portfolioCountry, targets: missionState.oppositionCountries, evidence: modelEvidence };
+  const analysisPrompt = `${MASTER_SYSTEM_PROMPT}
+MISSION AND EVIDENCE PAYLOAD:${JSON.stringify(analysisPayload)}
+TASK: Return JSON only. Analyze ONLY the supplied retrieved evidence records. Each record contains evidenceId, original URL, source quality, publication date, and bounded extracted text. Do not use model memory. Do not invent evidence. Do not invent URLs. Do not invent evidence IDs. Every pressure point must reference evidenceIds that exist in EVIDENCE. Set claimSupported true only when the extracted text supports the claim. A SearXNG search snippet alone is insufficient evidence. Wikipedia cannot be used as evidence. If no defensible pressure points exist, return an empty pressurePoints array.
+Each pressure point needs id,type,target,eventDate,sourceName,organization,publicationDate,claim,evidenceExcerpt,evidenceIds,claimSupported,agendaRelevance,portfolioRelevance,legalRelevance,verificationStatus.`;
+  let structured;
+  try {
+    structured = await callGemini(form.apiKey, analysisPrompt, { ...modelSelection, schema: null, requestContext: { stage: 'Researching Pressure Points', operation: 'searxng-evidence-analysis' } });
+  } catch (error) {
+    const packet = { status: RESEARCH_STATUS.UNAVAILABLE, raw: { status: RESEARCH_STATUS.UNAVAILABLE, pressurePoints: [], warning: 'Malformed/invalid research response', providerError: error.message }, rankedPressurePoints: [], availableVerifiedPressurePoints: [], candidatePoolSize: 0, evidence, provider: 'searxng', queries: planned.queries, model: error.model || null, missionState, cacheKey: key, createdAt: new Date().toISOString() };
+    stage(onProgress, 'Researching Pressure Points', 'FAILED', `Malformed/invalid research response: ${error.message}`, 0, 1);
+    researchCache.set(key, packet); return packet;
+  }
+  let parsed;
+  try { parsed = extractJson(structured.text); }
+  catch (error) {
+    const packet = { status: RESEARCH_STATUS.UNAVAILABLE, raw: { status: RESEARCH_STATUS.UNAVAILABLE, pressurePoints: [], warning: 'Malformed/invalid research response', providerError: error.message }, rankedPressurePoints: [], availableVerifiedPressurePoints: [], candidatePoolSize: 0, evidence, provider: 'searxng', queries: planned.queries, model: structured.model, missionState, cacheKey: key, createdAt: new Date().toISOString() };
+    stage(onProgress, 'Researching Pressure Points', 'FAILED', `Malformed/invalid research response: ${error.message}`, 0, 1);
+    researchCache.set(key, packet); return packet;
+  }
+  const derived = deriveResearchPacket(parsed, evidence, missionState, RESEARCH_STATUS.READY);
+  const packet = { ...derived, provider: 'searxng', queries: planned.queries, model: structured.model, missionState, cacheKey: key, createdAt: new Date().toISOString() };
   setCandidatePoolSize(packet, missionState.totalPois);
-  stage(onProgress, 'Researching Pressure Points', packet.status === 'READY' ? 'COMPLETE' : 'FAILED', `${packet.status}: ${packet.availableVerifiedPressurePoints.length} verified pressure point(s).`, packet.availableVerifiedPressurePoints.length, Math.max(packet.rankedPressurePoints.length, 1));
+  const detail = packet.status === RESEARCH_STATUS.READY ? `${packet.status}: ${packet.availableVerifiedPressurePoints.length} verified pressure point(s).` : 'Search completed but no usable evidence survived validation.';
+  stage(onProgress, 'Researching Pressure Points', packet.status === RESEARCH_STATUS.READY ? 'COMPLETE' : 'FAILED', detail, packet.availableVerifiedPressurePoints.length, Math.max(packet.rankedPressurePoints.length, 1));
   researchCache.set(key, packet); return packet;
 }
 export async function generateMission({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount, poiTypes = ['AUTO'], customPoiType = '', poisPerOppositionCountry = 0, researchNotes = '', researchLinks = [], backgroundGuideText = '', freezeDate = '', easyLanguage = false, oppositionPriority = false, onProgress, modelSelection }) {
@@ -145,7 +163,7 @@ export async function generateMission({ form, sliders, selectedTargets, targetin
   stage(onProgress, 'Legal Frameworks', 'COMPLETE', `Ranked ${researchPacket.rankedPressurePoints.length} pressure point(s); ${rankedCandidatePool.length} verified candidate(s) eligible for generation.`, rankedCandidatePool.length, Math.max(1, researchPacket.rankedPressurePoints.length));
   const prompt = buildMissionPrompt({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount: missionState.totalPois, poiTypes: missionState.poiTypes, missionState, researchPacket, rankedCandidatePool });
   const params = assertRuntime(missionState, runtimeParams(missionState, oppositionOnly ? missionState.oppositionCountries.map((c) => c.name).join(', ') : 'GLOBAL/OPPOSITION'));
-  const response = await callGemini(form.apiKey, `${prompt}\nRUNTIME PARAMETER ASSERTION:${JSON.stringify(params)}`, { ...modelSelection, schema: CHITFORGE_RESPONSE_SCHEMA, useGoogleSearch: false, requestContext: { stage: 'Generating Main POIs', operation: 'main-generation' }, onModelStatus: (status) => onProgress?.({ stage: 'Generating Main POIs', status: 'RUNNING', detail: `Using ${status.model.displayName}.`, done: 0, total: missionState.totalPois }) });
+  const response = await callGemini(form.apiKey, `${prompt}\nRUNTIME PARAMETER ASSERTION:${JSON.stringify(params)}`, { ...modelSelection, schema: CHITFORGE_RESPONSE_SCHEMA, requestContext: { stage: 'Generating Main POIs', operation: 'main-generation' }, onModelStatus: (status) => onProgress?.({ stage: 'Generating Main POIs', status: 'RUNNING', detail: `Using ${status.model.displayName}.`, done: 0, total: missionState.totalPois }) });
   let mission = await recoverMission({ apiKey: form.apiKey, text: response.text, ctx: { form, sliders, includeFollowUp, poiCount: missionState.totalPois, targetingMode, poiTypes: missionState.poiTypes, lengthInfo: lengthInfo(sliders.length) }, modelSelection, modelInfo: { primaryModel: response.model.displayName } });
   stage(onProgress, 'Generating Main POIs', 'COMPLETE', `Generated ${mission.chits.length} main candidate POI(s).`, mission.chits.length, missionState.totalPois);
   mission.chits = enforceSafetyAndDiversity(mission.chits.map((poi) => attachPressurePointTrace(poi, researchPacket)), missionState, oppositionOnly).slice(0, INTERNAL_POI_CEILING);
@@ -223,6 +241,14 @@ export async function reviewChitsWithResearchPacket({ chits, form, apiKey, prima
   return reviewed.chits;
 }
 
+function buildReviewSupport(chits, researchPacket) {
+  const pointIds = new Set((chits || []).map((poi) => poi.pressurePointId).filter(Boolean));
+  const points = (researchPacket?.rankedPressurePoints || []).filter((point) => pointIds.has(point.id));
+  const evidenceIds = new Set(points.flatMap((point) => point.evidenceIds || []));
+  const evidence = buildModelEvidence((researchPacket?.evidence || []).filter((ev) => evidenceIds.has(ev.id)));
+  return { status: researchPacket?.status, pressurePoints: compactPressurePointsForModel(points, evidence, { maxEvidencePerPoint: 3 }), evidence };
+}
+
 async function runFactChecks({ mission, form, apiKey, primaryModel, modelSelection, onProgress, researchPacket, missionState }) {
   try {
     const prompt = `Return JSON only: {"reviews":[{"id":"poi-1","status":"PASS|NEEDS FIX|FAIL","reason":"short","sourceQuality":"PRIMARY|HIGH|GOOD|LIMITED","trapStrength":"one-liner"}]}.
@@ -230,7 +256,7 @@ Evidence-backed review must use the supplied research packet/source metadata/exc
 MISSION STATE:${JSON.stringify(missionState)}
 AGENDA:${form.agenda}
 PORTFOLIO:${form.portfolio}
-RESEARCH PACKET:${JSON.stringify({ raw: researchPacket?.raw || {}, groundingMetadata: researchPacket?.groundingMetadata || [] }).slice(0, 26000)}
+RESEARCH SUPPORT:${JSON.stringify(buildReviewSupport(mission.chits, researchPacket))}
 POIS:${JSON.stringify(mission.chits.map((c, i) => ({ id: c.id || `poi-${i + 1}`, pressurePointId: c.pressurePointId, target: c.target, poi: c.poi, pressurePoint: c.pressurePoint, legalFoundation: c.legalFoundation || c.legalPolicyFoundation, evidence: c.evidence })))};`;
     stage(onProgress, 'Review', 'RUNNING', `Batch reviewing ${mission.chits.length} POIs against stored evidence.`, 0, mission.chits.length);
     const res = await callFactCheck(apiKey, prompt, { primaryModelId: primaryModel.id, modelSelection });
@@ -239,7 +265,7 @@ POIS:${JSON.stringify(mission.chits.map((c, i) => ({ id: c.id || `poi-${i + 1}`,
     mission.chits = mission.chits.map((poi, i) => {
       const review = reviews.find((r) => r.id === poi.id || r.id === `poi-${i + 1}`) || { status: 'NEEDS FIX', reason: 'Review did not return a mapped evidence verdict.', sourceQuality: 'LIMITED', trapStrength: 'Manual review needed.' };
       const point = packetPointById(researchPacket, poi.pressurePointId);
-      const supportedPass = review.status === 'PASS' && hasPacketSupportForPoi(poi, point);
+      const supportedPass = review.status === 'PASS' && hasPacketSupportForPoi(poi, point, researchPacket);
       const status = supportedPass ? 'VERIFIED' : review.status === 'FAIL' ? 'FAILED' : 'MANUAL VERIFICATION';
       review.status = supportedPass ? 'PASS' : review.status === 'FAIL' ? 'FAIL' : 'NEEDS FIX';
       if (!supportedPass && review.status !== 'FAIL') review.reason = `${review.reason || 'Review needs source support.'} Packet evidence did not support VERIFIED/PASS.`;
@@ -269,7 +295,7 @@ IMMUTABLE MISSION STATE:
 ${missionState ? JSON.stringify(missionState) : 'LEGACY MODE'}
 
 RANKED VERIFIED PRESSURE-POINT CANDIDATE POOL (use only these IDs; sorted best first; do not invent beyond it):
-${rankedCandidatePool ? JSON.stringify(rankedCandidatePool.map((point) => ({ ...point, raw: undefined }))).slice(0, 24000) : researchPacket ? JSON.stringify(candidatePoolFor(researchPacket, poiCount).map((point) => ({ ...point, raw: undefined }))).slice(0, 24000) : 'No verified pressure-point pool supplied; mark uncertain claims MANUAL VERIFICATION.'}
+${rankedCandidatePool ? JSON.stringify(compactPressurePointsForModel(rankedCandidatePool, buildModelEvidence(researchPacket?.evidence || []))) : researchPacket ? JSON.stringify(compactPressurePointsForModel(candidatePoolFor(researchPacket, poiCount), buildModelEvidence(researchPacket?.evidence || []))) : 'No verified pressure-point pool supplied; mark uncertain claims MANUAL VERIFICATION.'}
 
 COMMITTEE:
 ${form.committee || 'Unspecified'}
