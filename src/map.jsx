@@ -55,7 +55,7 @@ export function WorldMap({ selected, setSelected, portfolio, setPortfolio }) {
     if (dragRef.current.moved || isPortfolioCountry(country)) return;
     setSelected(selectedIso.has(country.iso) ? selected.filter((c) => c.iso !== country.iso) : [...selected, { iso: country.iso, name: country.name }]);
   };
-  const inputTokens = (value) => value.split(/[\n,]+/).flatMap((token) => {
+  const inputTokens = (value) => value.split(/[\n,;]+/).flatMap((token) => {
     const trimmed = token.trim().toLowerCase();
     if (!trimmed) return [];
     if (countries.some((c) => c.name.toLowerCase() === trimmed || c.iso.toLowerCase() === trimmed)) return [trimmed];
@@ -109,7 +109,11 @@ export function WorldMap({ selected, setSelected, portfolio, setPortfolio }) {
   }, [applyTransform, view.scale]);
 
   return <div className="mapWrap">
-    <div className="mapTargetInput"><input value={targetInput} onChange={(e) => setTargetInput(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') addInputTarget(); }} placeholder="Add opposition by name or ISO code" /><button type="button" onClick={addInputTarget}>Add Opposition</button></div><div className="mapTools"><button type="button" onClick={() => setView((v) => ({ ...v, scale: Math.min(3, v.scale + 0.25) }))}>Zoom +</button><button type="button" onClick={() => setView((v) => ({ ...v, scale: Math.max(1, v.scale - 0.25) }))}>Zoom −</button><button type="button" onClick={() => setView({ scale: 1, x: 0, y: 0 })}>Reset</button><button type="button" onClick={() => setSelected([])}>Clear all</button></div>
+    <div className="mapControlStrip">
+      <div className="mapTargetInput"><input value={targetInput} onChange={(e) => setTargetInput(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') addInputTarget(); }} placeholder="Add opposition by name or ISO code" /><button type="button" onClick={addInputTarget}>Add Opposition</button></div>
+      <div className="mapTools"><button type="button" onClick={() => setView((v) => ({ ...v, scale: Math.min(3, v.scale + 0.25) }))}>Zoom +</button><button type="button" onClick={() => setView((v) => ({ ...v, scale: Math.max(1, v.scale - 0.25) }))}>Zoom −</button><button type="button" onClick={() => setView({ scale: 1, x: 0, y: 0 })}>Reset</button><button type="button" onClick={() => setSelected([])}>Clear all</button></div>
+      <p className="mapHint">Left-click = portfolio (green) · Right-click = opposition (red)</p>
+    </div>
     <svg className="pannableMap" viewBox="0 0 980 520" role="img" aria-label="Interactive real world map from Natural Earth geometry via world-atlas" onPointerDown={beginPan} onPointerMove={movePan} onPointerUp={endPan} onPointerCancel={endPan}>
       <defs><filter id="glow"><feGaussianBlur stdDeviation="3" result="blur" /><feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge></filter></defs>
       <rect className="ocean" width="980" height="520" />
