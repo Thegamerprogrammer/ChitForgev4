@@ -68,3 +68,11 @@ Public SearXNG instances may rate-limit, disable JSON output, block automated ac
 - Proxy fetches are sequential and bounded by timeout, redirect count, and response size.
 - In-memory caches last only for the current browser session/proxy process.
 - JavaScript-only pages, paywalls, bot blocks, missing publication dates, and ambiguous source reputation may prevent evidence from becoming usable.
+
+## Gemini input budget and compact evidence payloads
+
+ChitForge does not send entire retrieved webpages to Gemini. The research proxy may retrieve bounded source text internally, but the evidence layer converts it to compact model evidence records containing only the evidence ID, title, original URL, domain, source-quality summary, publication date, and bounded extracted excerpt.
+
+All Gemini request paths use an application-level input safety budget below Gemini's provider maximum. The current safety budget is 80,000 estimated input tokens. ChitForge uses a conservative character-based estimate (`Math.ceil(characters / 3.5)`), so the number is approximate rather than an exact tokenizer count.
+
+When evidence is large, ChitForge compacts before the Gemini boundary by deduplicating canonical URLs, dropping duplicate excerpts, trimming individual excerpts, preferring higher-quality/relevant sources, and enforcing a total model-evidence character budget. If the complete Gemini request is still over budget, ChitForge fails locally before sending the request to Gemini.

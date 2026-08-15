@@ -11,6 +11,39 @@ export class GeminiError extends Error {
   }
 }
 
+
+export const MAX_GEMINI_INPUT_TOKENS = 80000;
+export const GEMINI_TOKEN_ESTIMATE_CHARS_PER_TOKEN = 3.5;
+
+export function estimateGeminiInputTokens(value) {
+  const text = typeof value === 'string' ? value : JSON.stringify(value || '');
+  return Math.ceil(text.length / GEMINI_TOKEN_ESTIMATE_CHARS_PER_TOKEN);
+}
+
+export function getGeminiPayloadStats(body, { budget = MAX_GEMINI_INPUT_TOKENS, trimmed = false, requestContext = {} } = {}) {
+  const serialized = typeof body === 'string' ? body : JSON.stringify(body || '');
+  return { characters: serialized.length, estimatedTokens: estimateGeminiInputTokens(serialized), budget, trimmed: !!trimmed, requestContext: { stage: requestContext.stage || 'unknown', operation: requestContext.operation || 'generateContent' } };
+}
+
+function logGeminiBudget(stats) {
+  const isDev = typeof import.meta !== 'undefined' && import.meta.env?.DEV;
+  if (!isDev && !globalThis.process) return;
+  const label = stats.requestContext?.operation || stats.requestContext?.stage || 'generateContent';
+  console.info(`[Gemini] ${label}`, { characters: stats.characters, estimatedTokens: stats.estimatedTokens, budget: stats.budget, trimmed: stats.trimmed, stage: stats.requestContext?.stage });
+}
+
+export function assertGeminiPayloadWithinBudget(body, { requestContext = {}, budget = MAX_GEMINI_INPUT_TOKENS, trimmed = false } = {}) {
+  const stats = getGeminiPayloadStats(body, { budget, trimmed, requestContext });
+  logGeminiBudget(stats);
+  if (stats.estimatedTokens > budget) {
+    throw new GeminiError(`Gemini request too large before send: estimated ${stats.estimatedTokens} input tokens exceeds ChitForge safety budget ${budget}. Reduce agenda/background/evidence payload.`, { category: 'input-budget-exceeded', diagnostic: `REQUEST: ${stats.requestContext.operation}
+CHARACTERS: ${stats.characters}
+ESTIMATED TOKENS: ${stats.estimatedTokens}
+BUDGET: ${budget}` });
+  }
+  return stats;
+}
+
 const endpoint = (_key, id) => `${BASE_URL}/${API_VERSION}/models/${id}:generateContent`;
 const listEndpoint = () => `${BASE_URL}/${API_VERSION}/models`;
 const redact = (value) => value ? `${value.slice(0, 4)}…${value.slice(-4)}` : '';
@@ -71,7 +104,9 @@ function retryDelayMs(retryAfter, attempt) {
 async function rawGenerate(apiKey, model, prompt, schema, { timeoutMs = 70000, nativeJson = true, requestContext = {}, attempt = 1 } = {}) {
   const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(endpoint(apiKey, model.id), { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, signal: controller.signal, body: JSON.stringify(buildBody(prompt, schema, model, { nativeJson })) });
+    const body = buildBody(prompt, schema, model, { nativeJson });
+    assertGeminiPayloadWithinBudget(body, { requestContext, trimmed: requestContext.trimmed });
+    const res = await fetch(endpoint(apiKey, model.id), { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, signal: controller.signal, body: JSON.stringify(body) });
     if (!res.ok) {
       const reason = await parseErrorResponse(res);
       const retryAfter = res.headers.get('retry-after') || '';

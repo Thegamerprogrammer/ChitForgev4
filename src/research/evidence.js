@@ -76,3 +76,44 @@ export function hasUsablePressurePointEvidence(point, evidenceById = new Map(), 
   const independentDomains = new Set(supported.map((ev) => ev.domain));
   return strongPrimary || independentDomains.size >= 1;
 }
+
+export const MAX_DOCUMENT_CHARS = 6000;
+export const MAX_MODEL_EXCERPT_CHARS_PER_SOURCE = 2500;
+export const MAX_MODEL_EVIDENCE_CHARS = 50000;
+
+function relevanceScore(ev) {
+  const rel = ev.relevance || {};
+  return (ev.sourceQuality?.score || 0) + (rel.target ? 12 : 0) + (rel.agenda ? 10 : 0) + (rel.portfolio ? 5 : 0) + (rel.committee ? 4 : 0) + (ev.sourceQuality?.tier === 'primary' ? 20 : 0);
+}
+function excerptKey(excerpt) { return String(excerpt || '').toLowerCase().replace(/\s+/g, ' ').slice(0, 220); }
+export function buildModelEvidence(evidence = [], { maxTotalChars = MAX_MODEL_EVIDENCE_CHARS, maxExcerptChars = MAX_MODEL_EXCERPT_CHARS_PER_SOURCE } = {}) {
+  const byUrl = new Map();
+  for (const ev of evidence) {
+    if (!ev?.id || !ev.url) continue;
+    const key = canonicalUrl(ev.url) || ev.url;
+    const existing = byUrl.get(key);
+    if (!existing || relevanceScore(ev) > relevanceScore(existing)) byUrl.set(key, ev);
+  }
+  const seenExcerpts = new Set();
+  const ranked = [...byUrl.values()].sort((a, b) => relevanceScore(b) - relevanceScore(a) || String(a.id).localeCompare(String(b.id)));
+  const output = []; let total = 0;
+  for (const ev of ranked) {
+    const excerpt = String(ev.excerpt || '').replace(/\s+/g, ' ').trim().slice(0, maxExcerptChars);
+    const eKey = excerptKey(excerpt);
+    if (!excerpt || seenExcerpts.has(eKey)) continue;
+    const item = { evidenceId: ev.id, title: ev.title || '', url: ev.url, domain: ev.domain || domainFromUrl(ev.url), sourceQuality: ev.sourceQuality?.tier || 'unknown', sourceQualityScore: ev.sourceQuality?.score || 0, flags: ev.sourceQuality?.flags || [], publishedAt: ev.publishedAt || null, excerpt };
+    const size = JSON.stringify(item).length;
+    if (output.length && total + size > maxTotalChars) continue;
+    if (!output.length && size > maxTotalChars) item.excerpt = item.excerpt.slice(0, Math.max(500, maxTotalChars - JSON.stringify({ ...item, excerpt: '' }).length));
+    output.push(item); seenExcerpts.add(eKey); total += JSON.stringify(item).length;
+  }
+  return output;
+}
+
+export function compactPressurePointsForModel(points = [], evidence = [], { maxEvidencePerPoint = 2 } = {}) {
+  const byId = new Map(evidence.map((ev) => [ev.evidenceId || ev.id, ev]));
+  return points.map((point) => {
+    const usableIds = (point.evidenceIds || []).filter((id) => byId.has(id)).slice(0, maxEvidencePerPoint);
+    return { id: point.id, rank: point.rank, rankScore: point.rankScore, type: point.type, target: point.target, claim: point.claim, evidenceExcerpt: String(point.evidenceExcerpt || '').slice(0, 900), evidenceIds: usableIds, url: point.url, publicationDate: point.publicationDate, sourceName: point.sourceName, organization: point.organization, scores: point.scores };
+  }).filter((point) => point.evidenceIds.length);
+}

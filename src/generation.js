@@ -4,7 +4,7 @@ import { toInternalMission, validateInternalMission, extractJson } from './respo
 import { applyFactCheckToSources, validateSources } from './sourceValidation.js';
 import { planResearchQueries } from './research/planner.js';
 import { searchWithProvider, fetchDocuments } from './research/proxyClient.js';
-import { normalizeEvidence, hasUsablePressurePointEvidence as hasProviderEvidence, RESEARCH_STATUS } from './research/evidence.js';
+import { normalizeEvidence, hasUsablePressurePointEvidence as hasProviderEvidence, RESEARCH_STATUS, buildModelEvidence, compactPressurePointsForModel } from './research/evidence.js';
 
 export const MASTER_SYSTEM_PROMPT = `You are a ruthless but strictly evidence-based Model United Nations strategist who writes like a sharp floor delegate, not like an AI.
 Write only punchy, natural, spoken-English Points of Information. No robotic phrasing. No academic padding. No ceremonial openings. No “Distinguished Delegate”.
@@ -73,9 +73,11 @@ function setCandidatePoolSize(researchPacket, totalPois) {
 }
 function packetPointById(researchPacket, id) { return (researchPacket?.rankedPressurePoints || []).find((point) => point.id === id); }
 function hasPacketSupportForPoi(poi, point, researchPacket) {
-  if (!point || !hasUsablePressurePointEvidence(point, evidenceMap(researchPacket?.evidence || []), researchPacket?.missionState || {})) return false;
-  const poiEvidenceHasPointUrl = (poi.evidence || []).some((source) => hasRealUrl(source.url || source.source_url) && hasRealUrl(point.url) && (source.url || source.source_url) === point.url);
-  return hasRealUrl(point.url) && point.evidenceExcerpt.length >= 20 && (poiEvidenceHasPointUrl || (poi.evidence || []).some((source) => hasRealUrl(source.url || source.source_url)));
+  const evidenceById = evidenceMap(researchPacket?.evidence || []);
+  if (!point || !hasUsablePressurePointEvidence(point, evidenceById, researchPacket?.missionState || {})) return false;
+  const allowedUrls = new Set((point.evidenceIds || []).map((id) => evidenceById.get(id)?.url).filter(hasRealUrl));
+  const poiEvidenceHasBoundUrl = (poi.evidence || []).some((source) => allowedUrls.has(source.url || source.source_url));
+  return point.evidenceExcerpt.length >= 20 && poiEvidenceHasBoundUrl;
 }
 function attachPressurePointTrace(chit, researchPacket) {
   const point = packetPointById(researchPacket, chit.pressurePointId);
@@ -119,15 +121,12 @@ export async function runResearchPacket({ form, missionState, modelSelection, on
     stage(onProgress, 'Researching Pressure Points', 'FAILED', `${message}: ${error.message}`, 0, 1);
     researchCache.set(key, packet); return packet;
   }
+  const modelEvidence = buildModelEvidence(evidence);
+  const analysisPayload = { runtimeParameters: params, committee: form.committee, agenda: form.agenda, portfolio: missionState.portfolioCountry, targets: missionState.oppositionCountries, evidence: modelEvidence };
   const analysisPrompt = `${MASTER_SYSTEM_PROMPT}
-Return JSON only. Analyze ONLY the normalized retrieved evidence below. Do not use model memory. Do not invent URLs or evidence IDs. Every pressure point must reference evidenceIds that exist in EVIDENCE and must set claimSupported true only when the excerpt supports the claim. A SearXNG snippet alone is not enough. Wikipedia is rejected. If no defensible pressure points exist, return an empty pressurePoints array.
-Each pressure point needs id,type,target,eventDate,sourceName,organization,publicationDate,claim,evidenceExcerpt,evidenceIds,claimSupported,agendaRelevance,portfolioRelevance,legalRelevance,verificationStatus.
-RUNTIME PARAMETERS:${JSON.stringify(params)}
-COMMITTEE:${form.committee}
-AGENDA:${form.agenda}
-PORTFOLIO:${missionState.portfolioCountry}
-TARGETS:${JSON.stringify(missionState.oppositionCountries)}
-EVIDENCE:${JSON.stringify(evidence.map((ev) => ({ ...ev, excerpt: ev.excerpt.slice(0, 1200) }))).slice(0, 28000)}`;
+MISSION AND EVIDENCE PAYLOAD:${JSON.stringify(analysisPayload)}
+TASK: Return JSON only. Analyze ONLY the supplied retrieved evidence records. Each record contains evidenceId, original URL, source quality, publication date, and bounded extracted text. Do not use model memory. Do not invent evidence. Do not invent URLs. Do not invent evidence IDs. Every pressure point must reference evidenceIds that exist in EVIDENCE. Set claimSupported true only when the extracted text supports the claim. A SearXNG search snippet alone is insufficient evidence. Wikipedia cannot be used as evidence. If no defensible pressure points exist, return an empty pressurePoints array.
+Each pressure point needs id,type,target,eventDate,sourceName,organization,publicationDate,claim,evidenceExcerpt,evidenceIds,claimSupported,agendaRelevance,portfolioRelevance,legalRelevance,verificationStatus.`;
   let structured;
   try {
     structured = await callGemini(form.apiKey, analysisPrompt, { ...modelSelection, schema: null, requestContext: { stage: 'Researching Pressure Points', operation: 'searxng-evidence-analysis' } });
@@ -242,6 +241,14 @@ export async function reviewChitsWithResearchPacket({ chits, form, apiKey, prima
   return reviewed.chits;
 }
 
+function buildReviewSupport(chits, researchPacket) {
+  const pointIds = new Set((chits || []).map((poi) => poi.pressurePointId).filter(Boolean));
+  const points = (researchPacket?.rankedPressurePoints || []).filter((point) => pointIds.has(point.id));
+  const evidenceIds = new Set(points.flatMap((point) => point.evidenceIds || []));
+  const evidence = buildModelEvidence((researchPacket?.evidence || []).filter((ev) => evidenceIds.has(ev.id)));
+  return { status: researchPacket?.status, pressurePoints: compactPressurePointsForModel(points, evidence, { maxEvidencePerPoint: 3 }), evidence };
+}
+
 async function runFactChecks({ mission, form, apiKey, primaryModel, modelSelection, onProgress, researchPacket, missionState }) {
   try {
     const prompt = `Return JSON only: {"reviews":[{"id":"poi-1","status":"PASS|NEEDS FIX|FAIL","reason":"short","sourceQuality":"PRIMARY|HIGH|GOOD|LIMITED","trapStrength":"one-liner"}]}.
@@ -249,7 +256,7 @@ Evidence-backed review must use the supplied research packet/source metadata/exc
 MISSION STATE:${JSON.stringify(missionState)}
 AGENDA:${form.agenda}
 PORTFOLIO:${form.portfolio}
-RESEARCH PACKET:${JSON.stringify({ raw: researchPacket?.raw || {}, evidence: researchPacket?.evidence || [] }).slice(0, 26000)}
+RESEARCH SUPPORT:${JSON.stringify(buildReviewSupport(mission.chits, researchPacket))}
 POIS:${JSON.stringify(mission.chits.map((c, i) => ({ id: c.id || `poi-${i + 1}`, pressurePointId: c.pressurePointId, target: c.target, poi: c.poi, pressurePoint: c.pressurePoint, legalFoundation: c.legalFoundation || c.legalPolicyFoundation, evidence: c.evidence })))};`;
     stage(onProgress, 'Review', 'RUNNING', `Batch reviewing ${mission.chits.length} POIs against stored evidence.`, 0, mission.chits.length);
     const res = await callFactCheck(apiKey, prompt, { primaryModelId: primaryModel.id, modelSelection });
@@ -288,7 +295,7 @@ IMMUTABLE MISSION STATE:
 ${missionState ? JSON.stringify(missionState) : 'LEGACY MODE'}
 
 RANKED VERIFIED PRESSURE-POINT CANDIDATE POOL (use only these IDs; sorted best first; do not invent beyond it):
-${rankedCandidatePool ? JSON.stringify(rankedCandidatePool.map((point) => ({ ...point, raw: undefined }))).slice(0, 24000) : researchPacket ? JSON.stringify(candidatePoolFor(researchPacket, poiCount).map((point) => ({ ...point, raw: undefined }))).slice(0, 24000) : 'No verified pressure-point pool supplied; mark uncertain claims MANUAL VERIFICATION.'}
+${rankedCandidatePool ? JSON.stringify(compactPressurePointsForModel(rankedCandidatePool, buildModelEvidence(researchPacket?.evidence || []))) : researchPacket ? JSON.stringify(compactPressurePointsForModel(candidatePoolFor(researchPacket, poiCount), buildModelEvidence(researchPacket?.evidence || []))) : 'No verified pressure-point pool supplied; mark uncertain claims MANUAL VERIFICATION.'}
 
 COMMITTEE:
 ${form.committee || 'Unspecified'}
