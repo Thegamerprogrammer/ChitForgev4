@@ -1,13 +1,32 @@
 import { countWords, speakingSeconds, stripMarkdown } from './format.js';
+import countryList from 'world-countries';
 
 const validationTests = ['Agenda relevance', 'Portfolio alignment', 'Target relevance', 'Evidence exists', 'No fabricated citation', 'Legal classification accurate', 'POI usable in MUN', 'Aggression matches slider', 'Controversy matches slider', 'Diplomacy matches slider', 'Length matches slider', 'Word count calculated', 'Speaking time calculated', 'Important phrases emphasized', 'No ceremonial opening', 'Simple English', 'Direct question', 'Strong pressure point', 'Distinct tactical purpose'];
 
+export const UI_POI_MAX = 100;
+export const INTERNAL_POI_CEILING = 120;
 export const POI_TYPES = ['AUTO', 'POLICY CONTRADICTION', 'LEGAL ERROR', 'LEGAL TRAP', 'COMMITMENT CONTRADICTION', 'EVIDENCE TRAP', 'ACCOUNTABILITY', 'FINANCIAL PRESSURE', 'IMPLEMENTATION FAILURE', 'VOTING CONTRADICTION', 'TREATY / OBLIGATION', 'HISTORICAL CONTRADICTION', 'CONTROVERSY', 'CUSTOM'];
 const TYPE_ALIASES = new Map([['ACCOUNTABILITY QUESTION', 'ACCOUNTABILITY'], ['COMMITMENT TRAP', 'COMMITMENT CONTRADICTION'], ['IMPLEMENTATION CONTRADICTION', 'IMPLEMENTATION FAILURE'], ['LEGAL PRESSURE', 'LEGAL TRAP'], ['TACTICAL TRAP', 'EVIDENCE TRAP'], ['HIGH PRESSURE', 'ACCOUNTABILITY'], ['MODERATE PRESSURE', 'ACCOUNTABILITY'], ['LOW PRESSURE', 'ACCOUNTABILITY']]);
 export function normalizeClassification(value) {
-  const raw = String(value || 'AUTO').trim().toUpperCase().replace(/[\s_-]+/g, ' ');
+  const original = String(value || 'AUTO').trim();
+  const raw = original.toUpperCase().replace(/[\s_-]+/g, ' ');
   const normalized = raw === 'TREATY OBLIGATION' ? 'TREATY / OBLIGATION' : raw;
-  return POI_TYPES.includes(normalized) ? normalized : (TYPE_ALIASES.get(normalized) || 'ACCOUNTABILITY');
+  if (POI_TYPES.includes(normalized) && normalized !== 'CUSTOM') return normalized;
+  if (TYPE_ALIASES.has(normalized)) return TYPE_ALIASES.get(normalized);
+  return original && normalized !== 'AUTO' ? original : 'ACCOUNTABILITY';
+}
+
+const COUNTRY_ALIASES = new Map(countryList.flatMap((country) => [[country.cca3, country.cca3], [country.cca2, country.cca3], [country.name.common, country.cca3], [country.name.official, country.cca3], ...(country.altSpellings || []).map((name) => [name, country.cca3])]).map(([key, value]) => [String(key || '').trim().toLowerCase(), value]));
+function countryKey(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  return COUNTRY_ALIASES.get(raw) || raw;
+}
+export function assertPortfolioSafety({ portfolioCountry, targetCountry, oppositionCountries = [], oppositionOnly = false }) {
+  const portfolioKey = countryKey(portfolioCountry);
+  const targetKey = countryKey(targetCountry);
+  if (targetCountry && targetKey === portfolioKey) throw new Error('Target safety blocked generation: portfolio country cannot be targeted.');
+  if (oppositionOnly && targetCountry && !oppositionCountries.some((c) => countryKey(c.name || c) === targetKey || countryKey(c.iso) === targetKey)) throw new Error('Target safety blocked generation: target is not in selected opposition countries.');
+  return true;
 }
 
 const ceremonial = /^(would|could|may|can)\s+(the\s+)?(distinguished|honou?rable|esteemed|delegate|delegation|representative)|^would\s+the\s+delegation\s+kindly/i;
@@ -16,7 +35,7 @@ export function validateMissionInputs({ agenda, portfolio, apiKey, poiCount }) {
   if (!agenda.trim()) return 'Enter an agenda/topic.';
   if (!portfolio.trim()) return 'Enter your portfolio/country.';
   if (!apiKey.trim()) return 'Missing Gemini API key. Enter your key and try again.';
-  if (!Number.isInteger(poiCount) || poiCount < 1 || poiCount > 20) return 'Choose a POI count from 1 to 20.';
+  if (!Number.isInteger(poiCount) || poiCount < 1 || poiCount > 100) return 'Choose a POI count from 1 to 100.';
   return '';
 }
 

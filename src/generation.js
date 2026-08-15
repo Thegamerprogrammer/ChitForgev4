@@ -1,37 +1,64 @@
 import { callGemini, callFactCheck, repairJsonWithGemini, GeminiError, CHITFORGE_RESPONSE_SCHEMA, FOLLOW_UP_RESPONSE_SCHEMA } from './gemini.js';
-import { findDuplicatePoiIndexes } from './validation.js';
+import { assertPortfolioSafety, findDuplicatePoiIndexes, INTERNAL_POI_CEILING } from './validation.js';
 import { toInternalMission, validateInternalMission, extractJson } from './responseParser.js';
 import { applyFactCheckToSources, validateSources } from './sourceValidation.js';
 
-export async function generateMission({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount, poiTypes = ['AUTO'], onProgress, modelSelection }) {
-  onProgress?.({ stage: 'INITIALIZING', detail: 'Initializing ChitForge synthesis engine.', done: 0, total: poiCount });
-  onProgress?.({ stage: 'READING AGENDA', detail: 'Reading committee, agenda and portfolio inputs.', done: 0, total: poiCount });
-  const prompt = buildMissionPrompt({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount, poiTypes });
-  onProgress?.({ stage: 'ANALYZING PORTFOLIO', detail: 'Analyzing portfolio foreign-policy interests.', done: 0, total: poiCount });
-  onProgress?.({ stage: 'ANALYZING FOREIGN POLICY', detail: 'Mapping foreign-policy alignment and constraints.', done: 0, total: poiCount });
-  onProgress?.({ stage: 'MAPPING TARGETS', detail: 'Mapping selected and global target opportunities.', done: 0, total: poiCount });
-  onProgress?.({ stage: 'RESEARCHING EVIDENCE', detail: 'Requesting traceable source-backed evidence.', done: 0, total: poiCount });
-  onProgress?.({ stage: 'ANALYZING LEGAL FRAMEWORKS', detail: 'Separating legal obligations from political commitments.', done: 0, total: poiCount });
-  let response = await callGemini(form.apiKey, prompt, { ...modelSelection, schema: CHITFORGE_RESPONSE_SCHEMA, onModelStatus: (status) => onProgress?.({ stage: 'MAPPING TARGETS', detail: `Using ${status.model.displayName} for ${status.mode}.`, done: 0, total: poiCount }) });
-  let text = response.text;
-  let mission = await recoverMission({ apiKey: form.apiKey, text, ctx: { form, sliders, includeFollowUp, poiCount, targetingMode, poiTypes, lengthInfo: lengthInfo(sliders.length) }, modelSelection, modelInfo: { primaryModel: response.model.displayName } });
-  const duplicates = findDuplicatePoiIndexes(mission.chits);
-  if (duplicates.length) {
-    onProgress?.({ stage: 'GENERATING POIs', detail: `Replacing ${duplicates.length} duplicate POI(s)...`, done: mission.chits.length - duplicates.length, total: poiCount });
-    mission = await replaceDuplicatePois({ form, sliders, includeFollowUp, mission, duplicates, poiCount, modelSelection });
-  }
-  const missing = Math.max(0, poiCount - mission.chits.length);
-  if (missing) {
-    onProgress?.({ stage: 'GENERATING POIs', detail: `Gemini returned ${mission.chits.length}/${poiCount}. Attempting ${missing} missing POI(s)...`, done: mission.chits.length, total: poiCount });
-    mission = await generateMissingPois({ form, sliders, selectedTargets, targetingMode, includeFollowUp, mission, missing, poiCount, poiTypes, modelSelection });
-  }
-  onProgress?.({ stage: 'VALIDATING STRUCTURE', detail: `${mission.chits.length}/${poiCount} usable POIs normalized. Validating source structures...`, done: mission.chits.length, total: poiCount });
-  mission.chits = await Promise.all(mission.chits.map(async (poi) => ({ ...poi, evidence: await validateSources(poi.evidence || []) })));
-  onProgress?.({ stage: 'CALCULATING PRESSURE', detail: 'Calculating local pressure, word count, line and speaking-time metrics.', done: mission.chits.length, total: poiCount });
-  mission = await runFactChecks({ mission, form, apiKey: form.apiKey, primaryModel: response.model, modelSelection, onProgress });
-  return { ...mission, modelInfo: { model: response.model, factCheckModel: mission.metadata.factCheckModel, mode: response.mode, fallbackLog: response.fallbackLog } };
-}
+export const MASTER_SYSTEM_PROMPT = `You are a ruthless but strictly evidence-based Model United Nations strategist who writes like a sharp floor delegate, not like an AI.
+Write only punchy, natural, spoken-English Points of Information. No robotic phrasing. No academic padding. No ceremonial openings. No “Distinguished Delegate”.
+Every POI is a trap. The hook is a documented pressure point — a scandal, controversy, commitment failure, verified historical bad event, voting contradiction, treaty issue, implementation failure, legal dispute or official contradiction — relevant to the agenda, portfolio foreign policy, target country, and freeze date.
+Aggression, Controversy, Diplomacy and Length must follow the exact live slider variable values and instructions supplied in the mission state. Length adds legal sauce and hook density — never fluff.
+Every factual claim must be grounded in a real, traceable source. Prefer primary sources. Never invent URLs, dates, statistics, quotes, scandals, events, positions, treaties or votes. If unverifiable → MANUAL VERIFICATION.
+Respect the freeze date. Easy Language means simpler spoken English without weakening the trap.
+Every POI must contain a genuinely applicable legal or policy foundation when one exists. Distinguish binding obligation from political commitment. Never fabricate a legal basis.
+Never generate the user’s portfolio country as a target. Use only allowed targets from the mission state.
+Output pure JSON matching the existing response schema. No markdown fences. No commentary.`;
 
+export const PROGRESS_STAGES = ['Research', 'Reading Agenda/Background/Freeze', 'Portfolio Foreign Policy', 'Mapping Opposition', 'Researching Pressure Points', 'Legal Frameworks', 'Generating Main POIs', 'Per-Opposition POIs', 'Structure + Source Validation', 'Fact Check', 'Review', 'Finalizing'];
+const researchCache = new Map();
+const hash = (value) => String(value || '').split('').reduce((a, c) => ((a << 5) - a + c.charCodeAt(0)) | 0, 0).toString(36);
+function stage(onProgress, name, status, detail, done = 0, total = 1) { onProgress?.({ stage: name, status, detail, done, total }); }
+export function captureMissionState({ form, sliders, selectedTargets = [], targetingMode, includeFollowUp, poiCount, poisPerOppositionCountry = 0, poiTypes = ['AUTO'], customPoiType = '', researchNotes = '', researchLinks = [], backgroundGuideText = '', freezeDate = '', easyLanguage = false, oppositionPriority = false, modelSelection = {} }) {
+  const custom = poiTypes.includes('CUSTOM') && customPoiType.trim() ? customPoiType.trim() : '';
+  return Object.freeze({ portfolioCountry: form.portfolio, oppositionCountries: selectedTargets.map((c) => ({ iso: c.iso, name: c.name })), targetMode: targetingMode, totalPois: Math.min(100, Math.max(1, Number(poiCount) || 1)), poisPerOppositionCountry: Math.max(0, Math.min(20, Number(poisPerOppositionCountry) || 0)), aggression: sliders.aggression, controversy: sliders.controversy, diplomacy: sliders.diplomacy, length: sliders.length, poiTypes: custom ? [custom] : poiTypes.filter((t) => t !== 'CUSTOM'), customPoiType: custom, researchNotes, researchLinks: researchLinks.filter(Boolean), backgroundGuideText, freezeDate, easyLanguage, oppositionPriority, includeFollowUp, selectedModel: modelSelection.manualModelId || '', modelMode: modelSelection.modelMode || 'best' });
+}
+function runtimeParams(missionState, targetCountry = '') { return { portfolioCountry: missionState.portfolioCountry, targetCountry, aggression: missionState.aggression, controversy: missionState.controversy, diplomacy: missionState.diplomacy, length: missionState.length, poiType: missionState.poiTypes.join(', '), customPoiType: missionState.customPoiType, easyLanguage: missionState.easyLanguage, freezeDate: missionState.freezeDate, researchNotesPresent: !!missionState.researchNotes, backgroundGuidePresent: !!missionState.backgroundGuideText }; }
+function assertRuntime(missionState, supplied) { ['portfolioCountry','aggression','controversy','diplomacy','length','easyLanguage','freezeDate'].forEach((k) => { if (supplied[k] !== missionState[k]) throw new GeminiError(`Runtime parameter assertion failed for ${k}.`, { category: 'runtime-parameter-assertion' }); }); return supplied; }
+function researchKey(form, missionState) { return JSON.stringify({ agenda: form.agenda, portfolio: missionState.portfolioCountry, freezeDate: missionState.freezeDate, notes: hash(missionState.researchNotes), guide: hash(missionState.backgroundGuideText), links: missionState.researchLinks, targets: missionState.oppositionCountries.map((c) => c.iso || c.name).sort() }); }
+export async function runResearchPacket({ form, missionState, modelSelection, onProgress }) {
+  const key = researchKey(form, missionState); if (researchCache.has(key)) return researchCache.get(key);
+  stage(onProgress, 'Researching Pressure Points', 'RUNNING', 'Using Gemini Google Search grounding to retrieve source-backed pressure points.', 0, 1);
+  const params = assertRuntime(missionState, runtimeParams(missionState, missionState.oppositionCountries.map((c) => c.name).join(', ') || 'GLOBAL'));
+  const prompt = `${MASTER_SYSTEM_PROMPT}\nReturn JSON only. Build a research packet with portfolioProfile and pressurePoints[]. Use Google Search grounding/retrieval. Do not use pretrained memory as evidence. If retrieval is unavailable return {"status":"RESEARCH UNAVAILABLE","pressurePoints":[]} and mark MANUAL VERIFICATION.\nRUNTIME PARAMETERS: ${JSON.stringify(params)}\nCOMMITTEE:${form.committee}\nAGENDA:${form.agenda}\nPORTFOLIO:${missionState.portfolioCountry}\nTARGETS:${JSON.stringify(missionState.oppositionCountries)}\nRESEARCH NOTES:${missionState.researchNotes}\nRESEARCH LINKS:${missionState.researchLinks.join('\n')}\nBACKGROUND GUIDE:${missionState.backgroundGuideText.slice(0,8000)}\nFREEZE DATE:${missionState.freezeDate}\nFind scandals/controversies and verified historical bad events separately. Each pressure point needs id,type,target,eventDate,sourceName,organization,url,publicationDate,claim,evidenceExcerpt,agendaRelevance,portfolioRelevance,legalRelevance,verificationStatus.`;
+  const response = await callGemini(form.apiKey, prompt, { ...modelSelection, useGoogleSearch: true, requestContext: { stage: 'Researching Pressure Points', operation: 'grounded-research' } });
+  const packet = { status: 'READY', raw: extractJson(response.text), groundingMetadata: response.groundingMetadata || [], model: response.model, cacheKey: key, createdAt: new Date().toISOString() };
+  researchCache.set(key, packet); return packet;
+}
+export async function generateMission({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount, poiTypes = ['AUTO'], customPoiType = '', poisPerOppositionCountry = 0, researchNotes = '', researchLinks = [], backgroundGuideText = '', freezeDate = '', easyLanguage = false, oppositionPriority = false, onProgress, modelSelection }) {
+  const missionState = captureMissionState({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount, poisPerOppositionCountry, poiTypes, customPoiType, researchNotes, researchLinks, backgroundGuideText, freezeDate, easyLanguage, oppositionPriority, modelSelection });
+  const oppositionOnly = targetingMode === 'selected_only';
+  if (oppositionOnly && !missionState.oppositionCountries.length) throw new GeminiError('Selected Opposition Only needs at least one opposition country. Generation stopped.', { category: 'target-safety' });
+  if (missionState.oppositionCountries.some((c) => c.name?.toLowerCase() === missionState.portfolioCountry.toLowerCase() || c.iso?.toLowerCase() === missionState.portfolioCountry.toLowerCase())) throw new GeminiError('Portfolio country cannot also be an opposition target.', { category: 'target-safety' });
+  PROGRESS_STAGES.forEach((name) => stage(onProgress, name, 'QUEUED', `${name} queued.`, 0, missionState.totalPois));
+  stage(onProgress, 'Reading Agenda/Background/Freeze', 'RUNNING', 'Captured immutable mission state and live slider values.', 0, missionState.totalPois);
+  const researchPacket = await runResearchPacket({ form, missionState, modelSelection, onProgress });
+  stage(onProgress, 'Legal Frameworks', 'RUNNING', 'Preparing pressure-point pool, diversity rules and legal-foundation constraints.', 0, missionState.totalPois);
+  const prompt = buildMissionPrompt({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount: missionState.totalPois, poiTypes: missionState.poiTypes, missionState, researchPacket });
+  const params = assertRuntime(missionState, runtimeParams(missionState, oppositionOnly ? missionState.oppositionCountries.map((c) => c.name).join(', ') : 'GLOBAL/OPPOSITION'));
+  const response = await callGemini(form.apiKey, `${prompt}\nRUNTIME PARAMETER ASSERTION:${JSON.stringify(params)}`, { ...modelSelection, schema: CHITFORGE_RESPONSE_SCHEMA, useGoogleSearch: false, requestContext: { stage: 'Generating Main POIs', operation: 'main-generation' }, onModelStatus: (status) => onProgress?.({ stage: 'Generating Main POIs', status: 'RUNNING', detail: `Using ${status.model.displayName}.`, done: 0, total: missionState.totalPois }) });
+  let mission = await recoverMission({ apiKey: form.apiKey, text: response.text, ctx: { form, sliders, includeFollowUp, poiCount: missionState.totalPois, targetingMode, poiTypes: missionState.poiTypes, lengthInfo: lengthInfo(sliders.length) }, modelSelection, modelInfo: { primaryModel: response.model.displayName } });
+  mission.chits = enforceSafetyAndDiversity(mission.chits, missionState, oppositionOnly).slice(0, INTERNAL_POI_CEILING);
+  const duplicates = findDuplicatePoiIndexes(mission.chits); if (duplicates.length) mission.chits = mission.chits.filter((_, i) => !duplicates.includes(i));
+  if (missionState.poisPerOppositionCountry) mission.chits.push(...await generateOppositionPois({ form, sliders, missionState, researchPacket, modelSelection, onProgress }));
+  stage(onProgress, 'Structure + Source Validation', 'RUNNING', 'Validating traceable source URLs and structures.', mission.chits.length, mission.chits.length);
+  mission.chits = await Promise.all(mission.chits.map(async (poi) => ({ ...poi, evidence: await validateSources(poi.evidence || []) })));
+  stage(onProgress, 'Fact Check', 'RUNNING', 'Running bounded evidence review against stored research packet.', 0, mission.chits.length);
+  mission = await runFactChecks({ mission, form, apiKey: form.apiKey, primaryModel: response.model, modelSelection, onProgress, researchPacket, missionState });
+  stage(onProgress, 'Review', 'COMPLETE', 'Evidence-backed review statuses applied.', mission.chits.length, mission.chits.length);
+  stage(onProgress, 'Finalizing', 'COMPLETE', 'Finalized POIs without fabricating sources.', mission.chits.length, mission.chits.length);
+  return { ...mission, researchPacket, modelInfo: { model: response.model, factCheckModel: mission.metadata.factCheckModel, mode: response.mode, fallbackLog: response.fallbackLog } };
+}
+async function generateOppositionPois({ form, sliders, missionState, researchPacket, modelSelection, onProgress }) { const out=[]; for (const target of missionState.oppositionCountries) { assertPortfolioSafety({ portfolioCountry: missionState.portfolioCountry, targetCountry: target.name, oppositionCountries: missionState.oppositionCountries, oppositionOnly: true }); stage(onProgress,'Per-Opposition POIs','RUNNING',`Generating ${missionState.poisPerOppositionCountry} opposition-tagged POIs for ${target.name}.`,out.length, missionState.poisPerOppositionCountry*missionState.oppositionCountries.length); const prompt=buildMissionPrompt({ form, sliders, selectedTargets:[target], targetingMode:'selected_only', includeFollowUp:missionState.includeFollowUp, poiCount:missionState.poisPerOppositionCountry, poiTypes:missionState.poiTypes, missionState, researchPacket })+`\nGenerate only target ${target.name}. Add oppositionTarget:true.`; const res=await callGemini(form.apiKey,prompt,{...modelSelection,schema:CHITFORGE_RESPONSE_SCHEMA,requestContext:{stage:'Per-Opposition POIs',operation:'opposition-generation'}}); const m=await recoverMission({apiKey:form.apiKey,text:res.text,ctx:{form,sliders,includeFollowUp:missionState.includeFollowUp,poiCount:missionState.poisPerOppositionCountry,targetingMode:'selected_only',poiTypes:missionState.poiTypes,lengthInfo:lengthInfo(sliders.length)},modelSelection,modelInfo:{primaryModel:res.model.displayName}}); out.push(...enforceSafetyAndDiversity(m.chits,missionState,true).map(c=>({...c,oppositionTarget:true,target:target.name}))); } return out; }
+function enforceSafetyAndDiversity(chits, missionState, oppositionOnly) { const seen=new Set(); return chits.filter((chit)=>{ try { assertPortfolioSafety({ portfolioCountry: missionState.portfolioCountry, targetCountry: chit.target, oppositionCountries: missionState.oppositionCountries, oppositionOnly }); } catch { return false; } const key=String(chit.documentedIssue||chit.poi).toLowerCase().replace(/[^a-z0-9]+/g,' ').slice(0,100); if (seen.has(key)) return false; seen.add(key); return true; }); }
 export async function regenerateChit({ form, sliders, chit, existingChits, apiKey, includeFollowUp, onProgress, modelSelection }) {
   onProgress?.({ stage: 'GENERATING POIs', detail: `Regenerating POI for ${chit.target}...`, done: 0, total: 1 });
   const prompt = `Return STRICT JSON only, no markdown fences. Regenerate exactly 1 distinct ChitForge POI to replace the weak POI below. Use the same agenda, portfolio, target, slider profile, evidence standards, simple English, no ceremonial opening, and Markdown bold emphasis. Do not duplicate these existing POIs: ${JSON.stringify(existingChits.map((item) => item.poi))}.\nAGENDA: ${form.agenda}\nPORTFOLIO: ${form.portfolio}\nTARGET: ${chit.target}\nSLIDERS: ${JSON.stringify(sliders)}\nFOLLOW-UP: ${includeFollowUp ? 'GENERATE' : 'DO NOT GENERATE'}\nOLD CHIT: ${JSON.stringify(chit)}\nReturn schema {"research_summary":"...","portfolio_alignment":"...","targets":[{"country":"${chit.target}","pressure_points":[{"poi":"...","legal_foundation":"...","evidence":[{"claim":"...","source_name":"...","source_url":"..."}],"documented_contradiction":"...","tactical_impact":"...","classification":"...","follow_up":${includeFollowUp ? '"..."' : 'null'}}]}]}`;
@@ -77,64 +104,57 @@ async function recoverMission({ apiKey, text, ctx, modelSelection, modelInfo }) 
   throw new GeminiError("Gemini returned a response that did not match ChitForge's required format.", { category: 'schema-failure' });
 }
 
-function buildFactCheckPrompt({ form, poi, pass }) {
-  const instruction = pass === 1 ? `You are ChitForge's factual verification engine. Independently verify every factual claim. Do not rewrite the POI. Classify each claim as verified, partially_verified, disputed, unverified, or false. Check dates, statistics, policies, resolutions, treaties, legal claims, institutional actions, financial claims and source relevance. Do not assume that a source proves a claim merely because it is listed.` : `Independently verify the factual and legal claims. Do not rely on another model's conclusion. Identify unsupported, exaggerated, misleading or incorrectly classified claims. Pay particular attention to legal terminology. Do not classify something as a legal violation unless the evidence actually supports that conclusion.`;
-  return `${instruction}
-Return ONLY valid JSON with overallStatus (VERIFIED|MANUAL_VERIFICATION|FAILED), confidence 0-100, claims[], legalAssessment, and classificationAssessment. Check whether each source actually supports its mapped claim and whether the POI classification is evidence-driven.
-AGENDA: ${form.agenda}
-PORTFOLIO: ${form.portfolio}
-TARGET: ${poi.target}
-POI: ${poi.poi}
-LEGAL FOUNDATION: ${poi.legalFoundation}
-CLASSIFICATION: ${poi.classification}
-CLASSIFICATION REASON: ${poi.classificationReason}
-EVIDENCE: ${JSON.stringify(poi.evidence)}
-DOCUMENTED ISSUE: ${poi.documentedIssue}`;
+export async function reviewChitsWithResearchPacket({ chits, form, apiKey, primaryModel, modelSelection, onProgress, researchPacket, missionState }) {
+  const mission = { chits, targets: [], metadata: {} };
+  const reviewed = await runFactChecks({ mission, form, apiKey, primaryModel: primaryModel || researchPacket?.model || { id: '' }, modelSelection, onProgress, researchPacket, missionState });
+  return reviewed.chits;
 }
 
-function normalizeFactCheck(parsed) {
-  const rawStatus = String(parsed.overallStatus || '').toUpperCase().replace(/_/g, ' ');
-  const status = ['VERIFIED', 'MANUAL VERIFICATION', 'FAILED'].includes(rawStatus) ? rawStatus : 'MANUAL VERIFICATION';
-  return { overallStatus: status, confidence: Number(parsed.confidence || 0), claims: Array.isArray(parsed.claims) ? parsed.claims.map((claim) => ({ ...claim, status: String(claim.status || 'UNVERIFIED').toUpperCase().replace(/ /g, '_') })) : [], legalAssessment: parsed.legalAssessment || { status: 'UNCERTAIN', reason: 'No legal assessment returned.' }, classificationAssessment: parsed.classificationAssessment || { status: 'UNCERTAIN', reason: 'No classification assessment returned.' } };
-}
-
-function combineFactChecks(first, second) {
-  if (first.overallStatus === 'FAILED' && second.overallStatus === 'FAILED') return { status: 'FAILED', confidence: Math.round((first.confidence + second.confidence) / 2), claims: [...first.claims, ...second.claims], legalAssessment: first.legalAssessment, classificationAssessment: first.classificationAssessment };
-  if (first.overallStatus === second.overallStatus && first.overallStatus === 'VERIFIED') return { status: 'VERIFIED', confidence: Math.round((first.confidence + second.confidence) / 2), claims: [...first.claims, ...second.claims], legalAssessment: first.legalAssessment, classificationAssessment: first.classificationAssessment };
-  return { status: 'MANUAL VERIFICATION', confidence: Math.round((first.confidence + second.confidence) / 2), claims: [...first.claims, ...second.claims], legalAssessment: first.legalAssessment, classificationAssessment: first.classificationAssessment };
-}
-
-async function runFactChecks({ mission, form, apiKey, primaryModel, modelSelection, onProgress }) {
-  const updated = []; let factCheckModel = '';
-  for (let i = 0; i < mission.chits.length; i += 1) {
-    const poi = mission.chits[i];
-    onProgress?.({ stage: 'FACT CHECK PASS 1', detail: `Fact-check pass 1 for POI ${i + 1}/${mission.chits.length}.`, done: i, total: mission.chits.length });
-    try {
-      const first = await callFactCheck(apiKey, buildFactCheckPrompt({ form, poi, pass: 1 }), { primaryModelId: primaryModel.id, modelSelection });
-      onProgress?.({ stage: 'FACT CHECK PASS 2', detail: `Fact-check pass 2 for POI ${i + 1}/${mission.chits.length}.`, done: i, total: mission.chits.length });
-      const second = await callFactCheck(apiKey, buildFactCheckPrompt({ form, poi, pass: 2 }), { primaryModelId: primaryModel.id, modelSelection });
-      factCheckModel = second.model.displayName;
-      { const combined = combineFactChecks(normalizeFactCheck(extractJson(first.text)), normalizeFactCheck(extractJson(second.text))); updated.push({ ...poi, factCheck: combined, evidence: applyFactCheckToSources(poi.evidence || [], combined) }); }
-    } catch {
-      updated.push({ ...poi, factCheck: { status: 'MANUAL VERIFICATION', confidence: 0, claims: [], legalAssessment: { status: 'UNCERTAIN', reason: 'Fact-check unavailable; verify evidence manually.' }, classificationAssessment: { status: 'UNCERTAIN', reason: 'Classification could not be independently verified.' } } });
-    }
+async function runFactChecks({ mission, form, apiKey, primaryModel, modelSelection, onProgress, researchPacket, missionState }) {
+  try {
+    const prompt = `Return JSON only: {"reviews":[{"id":"poi-1","status":"PASS|NEEDS FIX|FAIL","reason":"short","sourceQuality":"PRIMARY|HIGH|GOOD|LIMITED","trapStrength":"one-liner"}]}.
+Evidence-backed review must use the supplied research packet/source metadata/excerpts. Do not decide truth from model memory. PASS only if source evidence supports the POI. Do not perform new full research.
+MISSION STATE:${JSON.stringify(missionState)}
+AGENDA:${form.agenda}
+PORTFOLIO:${form.portfolio}
+RESEARCH PACKET:${JSON.stringify({ raw: researchPacket?.raw || {}, groundingMetadata: researchPacket?.groundingMetadata || [] }).slice(0, 26000)}
+POIS:${JSON.stringify(mission.chits.map((c, i) => ({ id: c.id || `poi-${i + 1}`, target: c.target, poi: c.poi, pressurePoint: c.pressurePoint, legalFoundation: c.legalFoundation || c.legalPolicyFoundation, evidence: c.evidence })))};`;
+    stage(onProgress, 'Review', 'RUNNING', `Batch reviewing ${mission.chits.length} POIs against stored evidence.`, 0, mission.chits.length);
+    const res = await callFactCheck(apiKey, prompt, { primaryModelId: primaryModel.id, modelSelection });
+    const parsed = extractJson(res.text);
+    const reviews = Array.isArray(parsed.reviews) ? parsed.reviews : [];
+    mission.chits = mission.chits.map((poi, i) => {
+      const review = reviews.find((r) => r.id === poi.id || r.id === `poi-${i + 1}`) || { status: 'NEEDS FIX', reason: 'Review did not return a mapped evidence verdict.', sourceQuality: 'LIMITED', trapStrength: 'Manual review needed.' };
+      const status = review.status === 'PASS' ? 'VERIFIED' : review.status === 'FAIL' ? 'FAILED' : 'MANUAL VERIFICATION';
+      return { ...poi, review, factCheck: { status, confidence: review.status === 'PASS' ? 80 : 0, claims: [], legalAssessment: { status: review.status, reason: review.reason }, classificationAssessment: { status: review.status, reason: review.trapStrength } }, evidence: applyFactCheckToSources(poi.evidence || [], { claims: [] }) };
+    });
+    mission.metadata.factCheckModel = res.model.displayName;
+  } catch {
+    mission.chits = mission.chits.map((poi) => ({ ...poi, review: { status: 'NEEDS FIX', reason: 'Evidence-backed review unavailable; manual verification required.', sourceQuality: 'LIMITED', trapStrength: 'Not reviewed.' }, factCheck: { status: 'MANUAL VERIFICATION', confidence: 0, claims: [], legalAssessment: { status: 'UNCERTAIN', reason: 'Review unavailable.' }, classificationAssessment: { status: 'UNCERTAIN', reason: 'Review unavailable.' } } }));
+    mission.metadata.factCheckModel = 'Unavailable';
   }
-  mission.chits = updated;
-  mission.targets = mission.targets.map((target) => ({ ...target, pois: updated.filter((poi) => poi.target === target.country) }));
-  onProgress?.({ stage: 'FINALIZING CHITS', detail: 'Final verification states calculated and chits finalized.', done: mission.chits.length, total: mission.chits.length });
-  mission.metadata.factCheckModel = factCheckModel || 'Unavailable';
+  mission.targets = (mission.targets || []).map((target) => ({ ...target, pois: mission.chits.filter((poi) => poi.target === target.country) }));
   return mission;
 }
 
+function lengthDensityInstruction(value) { return band(value, [[20, '1 tight hook, light legal reference.'], [40, '1–2 hooks, one clear legal/policy anchor.'], [60, '2 solid hooks or one strong multi-part trap + clear legal foundation.'], [80, 'Denser legal sauce + 2–3 linked hooks, still spoken and punchy.'], [100, 'Maximum legal source density + multiple pressure hooks in one tight POI. Every extra word must carry legal, factual or pressure value.']]); }
 function band(value, bands) { return bands.find(([max]) => value <= max)?.[1] || bands.at(-1)[1]; }
 export function lengthInfo(length) { return band(length, [[10, { lines: '≈ 1 line', words: 'approximately 8–15 words', min: 8, max: 15 }], [25, { lines: '≈ 1–2 lines', words: 'approximately 15–25 words', min: 15, max: 25 }], [40, { lines: '≈ 2 lines', words: 'approximately 20–35 words', min: 20, max: 35 }], [55, { lines: '≈ 2–3 lines', words: 'approximately 30–45 words', min: 30, max: 45 }], [70, { lines: '≈ 3 lines', words: 'approximately 40–55 words', min: 40, max: 55 }], [85, { lines: '≈ 3–4 lines', words: 'approximately 50–70 words', min: 50, max: 70 }], [100, { lines: '≈ 4–5 lines', words: 'approximately 65–90 words', min: 65, max: 90 }]]); }
 function aggressionInstruction(value) { return band(value, [[10, 'Use a calm, neutral question with minimal confrontation.'], [30, 'Use a mild challenge that asks for a clear policy explanation.'], [50, 'Use a firm challenge and clearly expose the relevant disagreement.'], [70, 'Use strong direct wording and pressure; ask how the delegation can justify the contradiction.'], [85, 'Use very aggressive but MUN-usable wording. Lead into the contradiction and give little room for vague answers.'], [100, 'Use maximum directness. Lead with the strongest verified contradiction, remove unnecessary diplomatic cushioning, end with a direct challenge, and do not soften the wording. Do not use insults or unsupported accusations.']]); }
 function controversyInstruction(value) { return band(value, [[10, 'Use a normal policy disagreement only.'], [30, 'Use a minor documented inconsistency if available.'], [50, 'Use a clear policy contradiction tied to the agenda.'], [70, 'Use a serious documented contradiction, commitment gap, vote, dispute, or implementation failure.'], [85, 'Prioritize major verified controversies, commitment failures, policy-practice gaps, legal disputes, or financial inconsistencies.'], [100, 'Search for the strongest relevant VERIFIED pressure point available: broken commitments, conflicting statements, voting contradictions, legal disputes, implementation failures, or financial inconsistencies. Never manufacture or exaggerate controversy.']]); }
 function diplomacyInstruction(value) { return band(value, [[10, 'Use blunt, direct wording. Do not add diplomatic cushioning.'], [30, 'Use very direct MUN wording with minimal restraint.'], [50, 'Use normal MUN language with moderate diplomatic restraint.'], [70, 'Use formal language while preserving pressure.'], [85, 'Use highly diplomatic polish without weakening the challenge.'], [100, 'Use maximum diplomatic polish, but preserve the same substantive pressure and direct question. High diplomacy does not reduce pressure.']]); }
-export function buildMissionPrompt({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount, poiTypes = ['AUTO'] }) {
+export function buildMissionPrompt({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount, poiTypes = ['AUTO'], missionState = null, researchPacket = null }) {
   const manualTargets = selectedTargets.map((c) => `${c.name} (${c.iso})`).join(', ') || 'NONE — target countries are optional; identify useful targets globally if target mode allows.';
   const info = lengthInfo(sliders.length);
-  return `COMMITTEE:
+  return `${MASTER_SYSTEM_PROMPT}
+
+IMMUTABLE MISSION STATE:
+${missionState ? JSON.stringify(missionState) : 'LEGACY MODE'}
+
+RESEARCH PACKET (use as evidence; do not invent beyond it):
+${researchPacket ? JSON.stringify(researchPacket.raw).slice(0, 24000) : 'No research packet supplied; mark uncertain claims MANUAL VERIFICATION.'}
+
+COMMITTEE:
 ${form.committee || 'Unspecified'}
 
 AGENDA:
@@ -194,7 +214,7 @@ Controversy controls research depth and political discomfort. ${controversyInstr
 
 Diplomacy controls wording. ${diplomacyInstruction(sliders.diplomacy)}
 
-Length controls actual word count. Stay approximately within ${info.words} and ${info.lines}. Do not add filler.
+Length controls legal density + hook density, zero fluff: ${lengthDensityInstruction(sliders.length)} Stay approximately within ${info.words} and ${info.lines}. Do not add filler.
 
 The ideal POI should expose a documented contradiction, obligation, commitment, policy failure or controversy that makes a clean evasive answer difficult.
 
@@ -261,19 +281,3 @@ Required JSON shape:
 {"pois":[{"target":"","question":"","legalFoundation":"","evidence":[{"sourceName":"","organization":"","publicationDate":"","url":"","claimSupported":"","sourceType":"PRIMARY","confidence":0}],"documentedIssue":"","classification":"","classificationReason":"","tacticalImpact":"","followUp":null}]}`;
 }
 
-async function generateMissingPois({ form, sliders, selectedTargets, targetingMode, includeFollowUp, mission, missing, poiCount, poiTypes = ['AUTO'], modelSelection }) {
-  const prompt = buildMissionPrompt({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount: missing, poiTypes }) + `\n\nAlready generated POIs to avoid duplicating: ${JSON.stringify(mission.chits.map((chit) => chit.poi))}. Generate exactly ${missing} additional distinct replacement POI chits only.`;
-  const response = await callGemini(form.apiKey, prompt, { ...modelSelection, schema: CHITFORGE_RESPONSE_SCHEMA });
-  const text = response.text;
-  const extra = await recoverMission({ apiKey: form.apiKey, text, ctx: { form, sliders, includeFollowUp, poiCount: missing, targetingMode, poiTypes, lengthInfo: lengthInfo(sliders.length) }, modelSelection, modelInfo: { primaryModel: response.model.displayName } });
-  return { ...mission, chits: [...mission.chits, ...extra.chits].slice(0, poiCount), recommendedTargets: [...(mission.recommendedTargets || []), ...(extra.recommendedTargets || [])] };
-}
-
-async function replaceDuplicatePois({ form, sliders, includeFollowUp, mission, duplicates, poiCount, modelSelection }) {
-  const keep = mission.chits.filter((_, index) => !duplicates.includes(index));
-  const prompt = `Return STRICT JSON only, no markdown fences. Generate exactly ${duplicates.length} distinct replacement POI chits. Do not duplicate these POIs: ${JSON.stringify(keep.map((chit) => chit.poi))}. Agenda: ${form.agenda}. Portfolio: ${form.portfolio}. Sliders: ${JSON.stringify(sliders)}. Follow-up: ${includeFollowUp ? 'GENERATE' : 'DO NOT GENERATE'}. Use the same ChitForge schema with targets[].pressure_points[].`;
-  const response = await callGemini(form.apiKey, prompt, { ...modelSelection, schema: CHITFORGE_RESPONSE_SCHEMA });
-  const text = response.text;
-  const replacement = await recoverMission({ apiKey: form.apiKey, text, ctx: { form, sliders, includeFollowUp, poiCount: duplicates.length, targetingMode: 'replacement', lengthInfo: lengthInfo(sliders.length) }, modelSelection, modelInfo: { primaryModel: response.model.displayName } });
-  return { ...mission, chits: [...keep, ...replacement.chits].slice(0, poiCount) };
-}
