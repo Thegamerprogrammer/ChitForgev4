@@ -32,7 +32,7 @@ export function classifySourceQuality({ url, text = '' } = {}) {
   if (!String(text || '').trim()) flags.push('snippet-only');
   const primary = /(^|\.)(gov|mil|int|un\.org|worldbank\.org|imf\.org|wto\.org|oecd\.org|icc-cpi\.int|icj-cij\.org|ohchr\.org)$/i.test(domain) || /\.gov\./i.test(domain);
   const academic = /\.edu$/i.test(domain) || /(^|\.)(jstor\.org|doi\.org|springer\.com|cambridge\.org|oxfordacademic\.com)$/i.test(domain);
-  const news = /(^|\.)(reuters\.com|apnews\.com|bbc\.|ft\.com|bloomberg\.com|aljazeera\.com|nytimes\.com|theguardian\.com|washingtonpost\.com)$/i.test(domain);
+  const news = /(^|\.)(reuters\.com|apnews\.com|bbc\.|bbc\.com|bbc\.co\.uk|ft\.com|bloomberg\.com|aljazeera\.com|nytimes\.com|theguardian\.com|washingtonpost\.com)$/i.test(domain);
   let tier = primary ? 'primary' : academic ? 'academic' : news ? 'established_secondary' : 'other';
   let score = primary ? 95 : academic ? 82 : news ? 78 : 45;
   if (flags.includes('wikipedia-rejected') || flags.includes('missing-url')) { tier = 'rejected'; score = 0; }
@@ -40,6 +40,24 @@ export function classifySourceQuality({ url, text = '' } = {}) {
   return { tier, flags, score };
 }
 function textContainsAny(text, values) { const hay = String(text || '').toLowerCase(); return values.some((v) => String(v || '').length > 2 && hay.includes(String(v).toLowerCase())); }
+const SERIOUS_RE = /\b(corrupt|corruption|scandal|fraud|illegal|violation|abuse|war crime|genocide|sanction|launder|bribe|criminal|atrocity|massacre|cover[- ]?up|coercive|forced|repression|torture)\b/i;
+export function isSeriousClaim(claim = '') { return SERIOUS_RE.test(String(claim)); }
+export function classifyClaimSupport({ claim = '', excerpt = '' } = {}) {
+  const c = String(claim || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const e = String(excerpt || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!c || !e) return 'UNSUPPORTED';
+  const stop = new Set(['about','after','against','their','there','which','would','could','should','policy','report','official','country','government','international','committee']);
+  const words = [...new Set(c.split(' ').filter((w) => w.length > 3 && !stop.has(w)))];
+  const hits = words.filter((w) => e.includes(w));
+  if (hits.length >= Math.max(3, Math.ceil(words.length * 0.55)) || e.includes(c.slice(0, Math.min(c.length, 120)))) return 'SUPPORTED';
+  if (hits.length >= Math.max(2, Math.ceil(words.length * 0.3))) return 'PARTIALLY_SUPPORTED';
+  return 'UNSUPPORTED';
+}
+function independentKey(ev) {
+  const domain = ev.domain || domainFromUrl(ev.url);
+  const wire = /\b(reuters|associated press|ap news|afp)\b/i.exec(`${ev.title || ''} ${ev.excerpt || ''}`)?.[1]?.toLowerCase();
+  return wire ? `wire:${wire}` : domain;
+}
 function dateAfter(date, freezeDate) { if (!date || !freezeDate) return false; const a = Date.parse(date); const b = Date.parse(freezeDate); return Number.isFinite(a) && Number.isFinite(b) && a > b; }
 export function normalizeEvidence({ results = [], documents = [], missionState = {}, provider = 'searxng' } = {}) {
   const byUrl = new Map(documents.map((d) => [canonicalUrl(d.url), d]));
@@ -69,12 +87,16 @@ export function hasUsablePressurePointEvidence(point, evidenceById = new Map(), 
   if (!usable.length) return false;
   const status = String(point.verificationStatus || point.status || '').toUpperCase();
   if (/MANUAL VERIFICATION|UNVERIFIED|GARBAGE|RESEARCH UNAVAILABLE|NOT VERIFIED/.test(status)) return false;
-  const claim = String(point.claim || '').toLowerCase();
-  const supported = usable.filter((ev) => point.claimSupported === true || String(ev.excerpt || '').toLowerCase().split(/\W+/).filter((w) => w.length > 5 && claim.includes(w)).length >= 2);
+  if (point.claimSupported !== true) return false;
+  const supported = usable.filter((ev) => {
+    const support = point.claimSupportStatus || classifyClaimSupport({ claim: point.claim, excerpt: ev.excerpt });
+    return support === 'SUPPORTED' && ['primary','academic','established_secondary'].includes(ev.sourceQuality?.tier);
+  });
   if (!supported.length) return false;
   const strongPrimary = supported.some((ev) => ev.sourceQuality?.tier === 'primary');
-  const independentDomains = new Set(supported.map((ev) => ev.domain));
-  return strongPrimary || independentDomains.size >= 1;
+  if (!isSeriousClaim(point.claim)) return true;
+  const independentSources = new Set(supported.filter((ev) => ev.sourceQuality?.tier !== 'other').map(independentKey));
+  return strongPrimary || independentSources.size >= 2;
 }
 
 export const MAX_DOCUMENT_CHARS = 6000;
@@ -108,6 +130,22 @@ export function buildModelEvidence(evidence = [], { maxTotalChars = MAX_MODEL_EV
     output.push(item); seenExcerpts.add(eKey); total += JSON.stringify(item).length;
   }
   return output;
+}
+
+export function compactResearchReferences(points = [], evidence = []) {
+  const byId = new Map(evidence.map((ev) => [ev.evidenceId || ev.id, ev]));
+  const seen = new Set();
+  const refs = [];
+  for (const point of points) for (const id of point.evidenceIds || []) {
+    const ev = byId.get(id); if (!ev?.url || seen.has(ev.url)) continue;
+    seen.add(ev.url); refs.push({ evidenceId: id, pressurePointId: point.id, url: ev.url, searchResult: String(ev.snippet || ev.title || '').replace(/\s+/g, ' ').trim() });
+  }
+  return refs;
+}
+
+export function compactVerifiedPressurePointReferences(points = [], evidence = []) {
+  const byId = new Map(evidence.map((ev) => [ev.evidenceId || ev.id, ev]));
+  return points.map((point) => ({ pressurePointId: point.id, claim: point.claim, relevance: point.relevance || point.evidenceExcerpt || point.scores?.agendaRelevance ? `Relevant to ${point.target || 'target'} and agenda pressure because the verified claim is tied to supplied retrieved evidence.` : '', evidenceIds: point.evidenceIds || [], sourceUrls: (point.evidenceIds || []).map((id) => byId.get(id)?.url).filter(Boolean) }));
 }
 
 export function compactPressurePointsForModel(points = [], evidence = [], { maxEvidencePerPoint = 2 } = {}) {

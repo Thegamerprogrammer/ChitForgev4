@@ -37,6 +37,7 @@ function App() {
   const [researchNotes, setResearchNotes] = useState(() => sessionStorage.getItem('chitforge:researchNotes') || '');
   const [researchLinksText, setResearchLinksText] = useState('');
   const [backgroundGuideText, setBackgroundGuideText] = useState('');
+  const [backgroundGuideFile, setBackgroundGuideFile] = useState(null);
   const [freezeDate, setFreezeDate] = useState(() => sessionStorage.getItem('chitforge:freezeDate') || '');
   const [poiTypes, setPoiTypes] = useState(['AUTO']);
   const [activity, setActivity] = useState([]);
@@ -100,7 +101,7 @@ function App() {
     setRecommendations([]);
     try {
       setActivity([]);
-      const result = await generateMission({ form, sliders, selectedTargets: selected, targetingMode: mode, includeFollowUp, poiCount, poisPerOppositionCountry, poiTypes, customPoiType, researchNotes, researchLinks: researchLinks(), backgroundGuideText, freezeDate, easyLanguage, oppositionPriority, onProgress: pushProgress, modelSelection });
+      const result = await generateMission({ form, sliders, selectedTargets: selected, targetingMode: mode, includeFollowUp, poiCount, poisPerOppositionCountry, poiTypes, customPoiType, researchNotes, researchLinks: researchLinks(), backgroundGuideText, backgroundGuideFile, freezeDate, easyLanguage, oppositionPriority, onProgress: pushProgress, modelSelection });
       setPortfolioProfile(result.portfolioProfile);
       setRecommendations(result.recommendedTargets || []);
       setChits(result.chits);
@@ -138,7 +139,7 @@ function App() {
   const copyAll = () => copyText(chits.map((chit, index) => `POI ${index + 1} — ${chit.target}\n${chit.poi}`).join('\n\n'));
   const copyOpposition = () => copyText(chits.filter((chit) => chit.oppositionTarget).map((chit, index) => `OPPOSITION POI ${index + 1} — ${chit.target}\n${chit.poi}`).join('\n\n'));
   const researchLinks = () => researchLinksText.split(/\n|,/).map((x) => x.trim()).filter(Boolean);
-  const missionStateForCurrentUi = () => captureMissionState({ form, sliders, selectedTargets: selected, targetingMode: mode, includeFollowUp, poiCount, poisPerOppositionCountry, poiTypes, customPoiType, researchNotes, researchLinks: researchLinks(), backgroundGuideText, freezeDate, easyLanguage, oppositionPriority, modelSelection });
+  const missionStateForCurrentUi = () => captureMissionState({ form, sliders, selectedTargets: selected, targetingMode: mode, includeFollowUp, poiCount, poisPerOppositionCountry, poiTypes, customPoiType, researchNotes, researchLinks: researchLinks(), backgroundGuideText, backgroundGuideFile, freezeDate, easyLanguage, oppositionPriority, modelSelection });
   const runResearchOnly = async () => {
     const validation = validateMissionInputs({ ...form, poiCount: 1 });
     setError(validation ? { message: validation } : null);
@@ -212,7 +213,7 @@ function App() {
           })} /> {type}
         </label>)}</div>{poiTypes.includes('CUSTOM') && <label className="customTypeField">Custom POI Type<input value={customPoiType} onChange={(e) => setCustomPoiType(e.target.value)} placeholder="Exact classification label" /></label>}
 
-        <h2>Research Mode</h2><div className="researchPanel glass-panel"><label>Research Notes<textarea value={researchNotes} onChange={(e) => setResearchNotes(e.target.value)} placeholder="Optional notes; changes invalidate factual cache." /></label><label>Research Links<textarea value={researchLinksText} onChange={(e) => setResearchLinksText(e.target.value)} placeholder="Optional URLs, one per line." /></label><label>Background Guide<input type="file" accept=".txt,.md,.pdf,.docx" onChange={async (e) => { const file = e.target.files?.[0]; setBackgroundGuideText(file ? await file.text().catch(() => '') : ''); }} /></label><label>Freeze Date<input value={freezeDate} onChange={(e) => setFreezeDate(e.target.value)} placeholder="Optional, e.g. 2026-08-15" /></label><div className="researchBuckets"><span>Scandals / Controversies</span><span>Verified Historical Bad Events</span></div><div className="row"><button type="button" onClick={runResearchOnly} disabled={busy}>Run Research Only</button><button type="button" onClick={runReviewCurrent} disabled={busy || !chits.length}>Run Review on Current POIs</button></div></div>
+        <h2>Research Mode</h2><div className="researchPanel glass-panel"><label>Research Notes<textarea value={researchNotes} onChange={(e) => setResearchNotes(e.target.value)} placeholder="Optional notes; changes invalidate factual cache." /></label><label>Research Links<textarea value={researchLinksText} onChange={(e) => setResearchLinksText(e.target.value)} placeholder="Optional URLs, one per line." /></label><label>Background Guide<input type="file" accept=".txt,.md,.pdf,.docx" onChange={async (e) => { const file = e.target.files?.[0]; if (!file) { setBackgroundGuideText(''); setBackgroundGuideFile(null); return; } const buffer = await file.arrayBuffer(); const bytes = new Uint8Array(buffer); let binary = ''; for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]); setBackgroundGuideFile({ name: file.name, mimeType: file.type || (file.name.endsWith('.pdf') ? 'application/pdf' : 'text/plain'), base64: btoa(binary) }); setBackgroundGuideText(file.type.startsWith('text/') || /\.(txt|md)$/i.test(file.name) ? await file.text().catch(() => '') : ''); }} /></label><label>Freeze Date<input value={freezeDate} onChange={(e) => setFreezeDate(e.target.value)} placeholder="Optional, e.g. 2026-08-15" /></label><div className="researchBuckets"><span>Scandals / Controversies</span><span>Verified Historical Bad Events</span></div><div className="row"><button type="button" onClick={runResearchOnly} disabled={busy}>Run Research Only</button><button type="button" onClick={runReviewCurrent} disabled={busy || !chits.length}>Run Review on Current POIs</button></div></div>
 
         <div className="notice"><b>TARGETS: OPTIONAL</b><br />{selected.length ? `${selected.length} manual target(s) selected.` : 'GLOBAL RESEARCH ENABLED unless Selected Targets Only is used.'}</div>
         {Object.keys(sliders).map((key) => <GlassRange key={key} name={key} value={sliders[key]} info={key === 'length' ? lengthInfo(sliders.length) : null} onCommit={commitSlider} />)}
