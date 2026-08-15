@@ -3,4 +3,7 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig({
   plugins: [react()],
+  optimizeDeps: {
+    include: ['d3-geo', 'd3-array', 'topojson-client'],
+  },
 });
