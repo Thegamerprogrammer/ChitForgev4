@@ -12,6 +12,7 @@ const CLASS_FIELDS = ['classification', 'poiType', 'type', 'category', 'trapType
 const CLASS_REASON_FIELDS = ['classificationReason', 'classification_reason', 'typeReason', 'categoryReason'];
 const FOLLOW_FIELDS = ['followUp', 'followup', 'follow_up', 'followUpQuestion'];
 const CONTAINER_FIELDS = ['pois', 'targets', 'chits', 'results', 'data', 'result', 'pressure_points'];
+const PRESSURE_POINT_ID_FIELDS = ['pressurePointId', 'pressure_point_id', 'pressurePointID', 'pressure_pointId', 'sourcePressurePointId'];
 
 export function extractGeminiText(response) {
   if (typeof response === 'string') return response;
@@ -72,7 +73,7 @@ function pushCandidate(out, obj, inheritedTarget) {
   const question = firstField(obj, QUESTION_FIELDS);
   if (!question || typeof question !== 'string') return;
   const target = firstField(obj, TARGET_FIELDS) || inheritedTarget || 'AUTO-DISCOVERED TARGET';
-  out.push({ target, question, legalFoundation: firstField(obj, LEGAL_FIELDS) || 'MANUAL VERIFICATION', evidence: normalizeEvidence(firstField(obj, EVIDENCE_FIELDS)), documentedIssue: firstField(obj, ISSUE_FIELDS) || 'MANUAL VERIFICATION', classification: normalizeClassification(firstField(obj, CLASS_FIELDS) || 'AUTO'), tacticalImpact: firstField(obj, TACTICAL_FIELDS) || 'MANUAL VERIFICATION', followUp: firstField(obj, FOLLOW_FIELDS) ?? null, classificationReason: firstField(obj, CLASS_REASON_FIELDS) || 'MANUAL VERIFICATION: classification reason was not supplied.' });
+  out.push({ pressurePointId: firstField(obj, PRESSURE_POINT_ID_FIELDS) || obj.pressurePoint?.id || '', target, question, legalFoundation: firstField(obj, LEGAL_FIELDS) || 'MANUAL VERIFICATION', evidence: normalizeEvidence(firstField(obj, EVIDENCE_FIELDS)), documentedIssue: firstField(obj, ISSUE_FIELDS) || 'MANUAL VERIFICATION', classification: normalizeClassification(firstField(obj, CLASS_FIELDS) || 'AUTO'), tacticalImpact: firstField(obj, TACTICAL_FIELDS) || 'MANUAL VERIFICATION', followUp: firstField(obj, FOLLOW_FIELDS) ?? null, classificationReason: firstField(obj, CLASS_REASON_FIELDS) || 'MANUAL VERIFICATION: classification reason was not supplied.' });
 }
 
 export function findPoiCandidates(value, inheritedTarget = undefined, seen = new Set()) {

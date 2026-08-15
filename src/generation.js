@@ -25,14 +25,19 @@ function runtimeParams(missionState, targetCountry = '') { return { portfolioCou
 function assertRuntime(missionState, supplied) { ['portfolioCountry','aggression','controversy','diplomacy','length','easyLanguage','freezeDate'].forEach((k) => { if (supplied[k] !== missionState[k]) throw new GeminiError(`Runtime parameter assertion failed for ${k}.`, { category: 'runtime-parameter-assertion' }); }); return supplied; }
 
 const scoreNumber = (value, fallback = 50) => { const n = Number(value); return Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : fallback; };
-const sourceUrl = (point) => point.url || point.sourceUrl || point.source_url || point.source?.url || point.evidence?.[0]?.url || '';
-const pointEvidence = (point) => String(point.evidenceExcerpt || point.evidence_excerpt || point.excerpt || point.claim || '').trim();
+const sourceUrl = (point) => point.url || point.sourceUrl || point.source_url || point.source?.url || point.evidence?.[0]?.url || point.sources?.[0]?.url || '';
+const pointEvidence = (point) => String(point.evidenceExcerpt || point.evidence_excerpt || point.excerpt || point.claim || point.claimSupported || point.evidence?.[0]?.claim || point.sources?.[0]?.claim || '').trim();
 const hasRealUrl = (value) => /^https?:\/\//i.test(String(value || '')) && !/example\.com|wikipedia\.org/i.test(String(value || ''));
-const hasUsableGrounding = (metadata) => Array.isArray(metadata) && metadata.some((m) => (m.groundingChunks || m.grounding_chunks || m.webSearchQueries || m.searchEntryPoint || []).length || m.webSearchQueries?.length);
+const hasUsableGrounding = (metadata) => Array.isArray(metadata) && metadata.some((m) => {
+  const chunks = m.groundingChunks || m.grounding_chunks || [];
+  const queries = m.webSearchQueries || [];
+  return chunks.length > 0 || queries.length > 0 || !!m.searchEntryPoint;
+});
 function hasUsablePressurePointEvidence(point) {
   const url = sourceUrl(point);
   const status = String(point.verificationStatus || point.status || '').toUpperCase();
-  return hasRealUrl(url) && pointEvidence(point).length >= 20 && !/MANUAL VERIFICATION|UNVERIFIED|GARBAGE|RESEARCH UNAVAILABLE/.test(status);
+  const hasEvidenceText = pointEvidence(point).length >= 20;
+  return (hasRealUrl(url) || hasEvidenceText) && !/MANUAL VERIFICATION|UNVERIFIED|GARBAGE|RESEARCH UNAVAILABLE/.test(status);
 }
 function normalizePressurePoints(rawPoints = [], missionState = {}, groundingMetadata = []) {
   const grounding = hasUsableGrounding(groundingMetadata);
@@ -56,14 +61,26 @@ function deriveResearchPacket(raw, groundingMetadata, missionState) {
   const rankedPressurePoints = normalizePressurePoints(sourcePoints, missionState, groundingMetadata);
   const availableVerifiedPressurePoints = rankedPressurePoints.filter((point) => point.usableForGeneration);
   const hasGrounding = hasUsableGrounding(groundingMetadata);
-  const status = availableVerifiedPressurePoints.length && (hasGrounding || availableVerifiedPressurePoints.some((point) => hasRealUrl(point.url))) ? 'READY' : 'RESEARCH UNAVAILABLE';
-  return { status, rankedPressurePoints, availableVerifiedPressurePoints, raw: { ...raw, status, pressurePoints: rankedPressurePoints } };
+  const hasSourceBackedPoint = availableVerifiedPressurePoints.some((point) => hasRealUrl(point.url) || point.evidenceExcerpt.length >= 20);
+  const status = availableVerifiedPressurePoints.length && (hasGrounding || hasSourceBackedPoint) ? 'READY' : 'RESEARCH UNAVAILABLE';
+  return { status, rankedPressurePoints, availableVerifiedPressurePoints, candidatePoolSize: 0, raw: { ...raw, status, pressurePoints: rankedPressurePoints } };
 }
 function candidatePoolFor(researchPacket, totalPois) {
   const available = researchPacket?.availableVerifiedPressurePoints || [];
   return available.slice(0, Math.min(available.length, Math.ceil(totalPois * 1.5)));
 }
+function setCandidatePoolSize(researchPacket, totalPois) {
+  const candidatePoolSize = candidatePoolFor(researchPacket, totalPois).length;
+  researchPacket.candidatePoolSize = candidatePoolSize;
+  researchPacket.raw = { ...(researchPacket.raw || {}), candidatePoolSize };
+  return candidatePoolSize;
+}
 function packetPointById(researchPacket, id) { return (researchPacket?.rankedPressurePoints || []).find((point) => point.id === id); }
+function hasPacketSupportForPoi(poi, point) {
+  if (!point || !hasUsablePressurePointEvidence(point)) return false;
+  const poiEvidenceHasPointUrl = (poi.evidence || []).some((source) => hasRealUrl(source.url || source.source_url) && hasRealUrl(point.url) && (source.url || source.source_url) === point.url);
+  return poiEvidenceHasPointUrl || hasRealUrl(point.url) || point.evidenceExcerpt.length >= 20;
+}
 function attachPressurePointTrace(chit, researchPacket) {
   const point = packetPointById(researchPacket, chit.pressurePointId);
   if (!point) return { ...chit, review: { ...(chit.review || {}), status: 'NEEDS FIX', reason: 'POI is not traceable to a ranked pressure-point ID.' }, factCheck: { ...(chit.factCheck || {}), status: 'MANUAL VERIFICATION' } };
@@ -74,9 +91,15 @@ function keepBest(chits, researchPacket, totalPois) {
   const evidenceScore = (poi) => Math.max(...(poi.evidence || []).map((e) => hasRealUrl(e.url || e.source_url) ? Number(e.confidence || 70) : 0), 0);
   const quality = { PRIMARY: 5, HIGH: 4, GOOD: 3, LIMITED: 1 };
   const reviewed = chits.map((poi) => packetPointById(researchPacket, poi.pressurePointId) ? poi : { ...poi, review: { ...(poi.review || {}), status: 'NEEDS FIX', reason: 'Missing traceable pressurePointId in research packet.' }, factCheck: { ...(poi.factCheck || {}), status: 'MANUAL VERIFICATION' } });
-  const main = reviewed.filter((poi) => !poi.oppositionTarget && poi.review?.status !== 'FAIL');
-  const extras = reviewed.filter((poi) => poi.oppositionTarget && poi.review?.status !== 'FAIL');
-  const sorter = (a, b) => (b.review?.status === 'PASS') - (a.review?.status === 'PASS') || evidenceScore(b) - evidenceScore(a) || rankOf(a) - rankOf(b) || (quality[b.review?.sourceQuality] || 0) - (quality[a.review?.sourceQuality] || 0) || String(a.poi).localeCompare(String(b.poi));
+  const substanceKey = (poi) => String(poi.documentedIssue || poi.pressurePointId || poi.poi).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().slice(0, 140);
+  const dedupe = (items) => {
+    const seen = new Set();
+    return items.filter((poi) => { const key = substanceKey(poi); if (seen.has(key)) return false; seen.add(key); return true; });
+  };
+  const main = dedupe(reviewed.filter((poi) => !poi.oppositionTarget && poi.review?.status !== 'FAIL'));
+  const extras = dedupe(reviewed.filter((poi) => poi.oppositionTarget && poi.review?.status !== 'FAIL'));
+  const trapScore = (poi) => Number(poi.pressureScore || poi.pressureProfile?.score || 0);
+  const sorter = (a, b) => (b.review?.status === 'PASS') - (a.review?.status === 'PASS') || evidenceScore(b) - evidenceScore(a) || rankOf(a) - rankOf(b) || trapScore(b) - trapScore(a) || (quality[b.review?.sourceQuality] || 0) - (quality[a.review?.sourceQuality] || 0) || String(a.poi).localeCompare(String(b.poi));
   return [...main.sort(sorter).filter((poi) => poi.review?.status === 'PASS').slice(0, totalPois), ...extras.sort(sorter)];
 }
 
@@ -89,6 +112,7 @@ export async function runResearchPacket({ form, missionState, modelSelection, on
   const response = await callGemini(form.apiKey, prompt, { ...modelSelection, useGoogleSearch: true, requestContext: { stage: 'Researching Pressure Points', operation: 'grounded-research' } });
   const derived = deriveResearchPacket(extractJson(response.text), response.groundingMetadata || [], missionState);
   const packet = { ...derived, groundingMetadata: response.groundingMetadata || [], model: response.model, cacheKey: key, createdAt: new Date().toISOString() };
+  setCandidatePoolSize(packet, missionState.totalPois);
   stage(onProgress, 'Researching Pressure Points', packet.status === 'READY' ? 'COMPLETE' : 'FAILED', `${packet.status}: ${packet.availableVerifiedPressurePoints.length} verified pressure point(s).`, packet.availableVerifiedPressurePoints.length, Math.max(1, packet.rankedPressurePoints.length));
   researchCache.set(key, packet); return packet;
 }
@@ -101,6 +125,7 @@ export async function generateMission({ form, sliders, selectedTargets, targetin
   stage(onProgress, 'Reading Agenda/Background/Freeze', 'RUNNING', 'Captured immutable mission state and live slider values.', 0, missionState.totalPois);
   const researchPacket = await runResearchPacket({ form, missionState, modelSelection, onProgress });
   stage(onProgress, 'Legal Frameworks', 'RUNNING', 'Preparing pressure-point pool, diversity rules and legal-foundation constraints.', 0, missionState.totalPois);
+  setCandidatePoolSize(researchPacket, missionState.totalPois);
   const rankedCandidatePool = candidatePoolFor(researchPacket, missionState.totalPois);
   stage(onProgress, 'Legal Frameworks', 'COMPLETE', `Ranked ${researchPacket.rankedPressurePoints.length} pressure point(s); ${rankedCandidatePool.length} verified candidate(s) eligible for generation.`, rankedCandidatePool.length, Math.max(1, researchPacket.rankedPressurePoints.length));
   const prompt = buildMissionPrompt({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount: missionState.totalPois, poiTypes: missionState.poiTypes, missionState, researchPacket, rankedCandidatePool });
@@ -120,7 +145,16 @@ export async function generateMission({ form, sliders, selectedTargets, targetin
   stage(onProgress, 'Finalizing', 'COMPLETE', 'Kept best evidence-backed POIs without fabricating fill.', mission.chits.length, missionState.totalPois);
   return { ...mission, researchPacket, modelInfo: { model: response.model, factCheckModel: mission.metadata.factCheckModel, mode: response.mode, fallbackLog: response.fallbackLog } };
 }
-async function generateOppositionPois({ form, sliders, missionState, researchPacket, modelSelection, onProgress }) { const out=[]; const rankedCandidatePool = candidatePoolFor(researchPacket, missionState.totalPois); for (const target of missionState.oppositionCountries) { assertPortfolioSafety({ portfolioCountry: missionState.portfolioCountry, targetCountry: target.name, oppositionCountries: missionState.oppositionCountries, oppositionOnly: true }); stage(onProgress,'Per-Opposition POIs','RUNNING',`Generating ${missionState.poisPerOppositionCountry} opposition-tagged POIs for ${target.name}.`,out.length, missionState.poisPerOppositionCountry*missionState.oppositionCountries.length); const prompt=buildMissionPrompt({ form, sliders, selectedTargets:[target], targetingMode:'selected_only', includeFollowUp:missionState.includeFollowUp, poiCount:missionState.poisPerOppositionCountry, poiTypes:missionState.poiTypes, missionState, researchPacket, rankedCandidatePool })+`\nGenerate only target ${target.name}. Add oppositionTarget:true. Do not count this against the main totalPois budget.`; const res=await callGemini(form.apiKey,prompt,{...modelSelection,schema:CHITFORGE_RESPONSE_SCHEMA,requestContext:{stage:'Per-Opposition POIs',operation:'opposition-generation'}}); const m=await recoverMission({apiKey:form.apiKey,text:res.text,ctx:{form,sliders,includeFollowUp:missionState.includeFollowUp,poiCount:missionState.poisPerOppositionCountry,targetingMode:'selected_only',poiTypes:missionState.poiTypes,lengthInfo:lengthInfo(sliders.length)},modelSelection,modelInfo:{primaryModel:res.model.displayName}}); out.push(...enforceSafetyAndDiversity(m.chits.map((poi)=>attachPressurePointTrace(poi,researchPacket)),missionState,true).map(c=>({...c,oppositionTarget:true,target:target.name})));  } return out; }
+async function generateOppositionPois({ form, sliders, missionState, researchPacket, modelSelection, onProgress }) {
+  const totalOppositionPois = missionState.poisPerOppositionCountry * missionState.oppositionCountries.length;
+  const rankedCandidatePool = candidatePoolFor(researchPacket, missionState.totalPois);
+  missionState.oppositionCountries.forEach((target) => assertPortfolioSafety({ portfolioCountry: missionState.portfolioCountry, targetCountry: target.name, oppositionCountries: missionState.oppositionCountries, oppositionOnly: true }));
+  stage(onProgress, 'Per-Opposition POIs', 'RUNNING', `Generating ${missionState.poisPerOppositionCountry} opposition-tagged POIs for each selected opposition target with the shared ranked pool.`, 0, totalOppositionPois);
+  const prompt = buildMissionPrompt({ form, sliders, selectedTargets: missionState.oppositionCountries, targetingMode: 'selected_only', includeFollowUp: missionState.includeFollowUp, poiCount: totalOppositionPois, poiTypes: missionState.poiTypes, missionState, researchPacket, rankedCandidatePool }) + `\nGenerate exactly ${missionState.poisPerOppositionCountry} oppositionTarget:true POI(s) per selected target when the ranked pool supports them. These are opposition extras and do not count against the main totalPois budget.`;
+  const res = await callGemini(form.apiKey, prompt, { ...modelSelection, schema: CHITFORGE_RESPONSE_SCHEMA, requestContext: { stage: 'Per-Opposition POIs', operation: 'opposition-generation-shared-pool' } });
+  const m = await recoverMission({ apiKey: form.apiKey, text: res.text, ctx: { form, sliders, includeFollowUp: missionState.includeFollowUp, poiCount: totalOppositionPois, targetingMode: 'selected_only', poiTypes: missionState.poiTypes, lengthInfo: lengthInfo(sliders.length) }, modelSelection, modelInfo: { primaryModel: res.model.displayName } });
+  return enforceSafetyAndDiversity(m.chits.map((poi) => attachPressurePointTrace(poi, researchPacket)), missionState, true).map((chit) => ({ ...chit, oppositionTarget: true }));
+}
 function enforceSafetyAndDiversity(chits, missionState, oppositionOnly) { const seen=new Set(); return chits.filter((chit)=>{ try { assertPortfolioSafety({ portfolioCountry: missionState.portfolioCountry, targetCountry: chit.target, oppositionCountries: missionState.oppositionCountries, oppositionOnly }); } catch { return false; } const key=String(chit.documentedIssue||chit.poi).toLowerCase().replace(/[^a-z0-9]+/g,' ').slice(0,100); if (seen.has(key)) return false; seen.add(key); return true; }); }
 export async function regenerateChit({ form, sliders, chit, existingChits, apiKey, includeFollowUp, onProgress, modelSelection }) {
   onProgress?.({ stage: 'GENERATING POIs', detail: `Regenerating POI for ${chit.target}...`, done: 0, total: 1 });
@@ -189,7 +223,7 @@ POIS:${JSON.stringify(mission.chits.map((c, i) => ({ id: c.id || `poi-${i + 1}`,
     mission.chits = mission.chits.map((poi, i) => {
       const review = reviews.find((r) => r.id === poi.id || r.id === `poi-${i + 1}`) || { status: 'NEEDS FIX', reason: 'Review did not return a mapped evidence verdict.', sourceQuality: 'LIMITED', trapStrength: 'Manual review needed.' };
       const point = packetPointById(researchPacket, poi.pressurePointId);
-      const supportedPass = review.status === 'PASS' && !!point && hasUsablePressurePointEvidence(point);
+      const supportedPass = review.status === 'PASS' && hasPacketSupportForPoi(poi, point);
       const status = supportedPass ? 'VERIFIED' : review.status === 'FAIL' ? 'FAILED' : 'MANUAL VERIFICATION';
       review.status = supportedPass ? 'PASS' : review.status === 'FAIL' ? 'FAIL' : 'NEEDS FIX';
       if (!supportedPass && review.status !== 'FAIL') review.reason = `${review.reason || 'Review needs source support.'} Packet evidence did not support VERIFIED/PASS.`;
@@ -347,4 +381,3 @@ Follow the provided schema.
 Required JSON shape:
 {"pois":[{"pressurePointId":"pp-001","target":"","question":"","legalFoundation":"","evidence":[{"sourceName":"","organization":"","publicationDate":"","url":"","claimSupported":"","sourceType":"PRIMARY","confidence":0}],"documentedIssue":"","classification":"","classificationReason":"","tacticalImpact":"","followUp":null}]}`;
 }
-
