@@ -1,6 +1,7 @@
 import { countWords, speakingSeconds, stripMarkdown } from './format.js';
 import { calculatePressureScore, classifyPressure, findDuplicatePoiIndexes, normalizeClassification } from './validation.js';
 import { normalizeEvidenceSource } from './sourceValidation.js';
+import { classifyTacticalImpact } from './tactical.js';
 
 const QUESTION_FIELDS = ['poi', 'question', 'questionText', 'poiQuestion', 'text', 'chit', 'content'];
 const TARGET_FIELDS = ['target', 'targetCountry', 'country', 'countryName', 'delegation'];
@@ -8,6 +9,7 @@ const LEGAL_FIELDS = ['legalFoundation', 'legalBasis', 'legal', 'legalFramework'
 const EVIDENCE_FIELDS = ['evidence', 'sources', 'citations', 'references', 'evidenceSources'];
 const ISSUE_FIELDS = ['documentedIssue', 'issue', 'contradiction', 'violation', 'problem', 'documented_contradiction'];
 const TACTICAL_FIELDS = ['tacticalImpact', 'impact', 'pressurePoint', 'tacticalPressure', 'tactical_impact'];
+const TACTICAL_IMPACTS = ['LEGAL ACCUSATION', 'HIGH PRESSURE', 'TACTICAL TRAP', 'MODERATE PRESSURE', 'LOW PRESSURE'];
 const CLASS_FIELDS = ['classification', 'poiType', 'type', 'category', 'trapType'];
 const CLASS_REASON_FIELDS = ['classificationReason', 'classification_reason', 'typeReason', 'categoryReason'];
 const FOLLOW_FIELDS = ['followUp', 'followup', 'follow_up', 'followUpQuestion'];
@@ -116,6 +118,12 @@ function chooseClassification(candidate, ctx) {
   return classifyPressure(50);
 }
 
+function normalizeTacticalImpact(candidate, ctx, classification, pressureScore) {
+  const supplied = String(candidate.tacticalImpact || '').toUpperCase().trim();
+  if (TACTICAL_IMPACTS.includes(supplied)) return supplied;
+  return classifyTacticalImpact({ claim: candidate.documentedIssue || candidate.question, legalFoundation: candidate.legalFoundation, evidenceIds: (candidate.evidence || []).map((_, i) => `ev-${i + 1}`), rankScore: pressureScore, type: classification, usableForGeneration: true }, ctx.sliders);
+}
+
 function normalizePortfolioProfile(parsed) {
   const profile = parsed?.portfolioProfile || {};
   const sources = normalizeEvidence(profile.sources || parsed?.portfolioSources || []);
@@ -134,7 +142,7 @@ export function normalizePoi(candidate, ctx, index) {
   const classification = chooseClassification(candidate, ctx);
   const pressureScore = calculatePressureScore(ctx.sliders, evidenceScore, 60, 70, 70, /legal|treaty|charter|resolution|obligation/i.test(candidate.legalFoundation) ? 70 : 45);
   const wordCount = countWords(poiText);
-  return { id: `poi-${index + 1}`, pressurePointId: candidate.pressurePointId || candidate.pressure_point_id || candidate.pressurePoint?.id || '', target: candidate.target || 'AUTO-DISCOVERED TARGET', poi: poiText, legalFoundation: candidate.legalFoundation || 'MANUAL VERIFICATION', legalPolicyFoundation: candidate.legalFoundation || 'MANUAL VERIFICATION', evidence, documentedIssue: candidate.documentedIssue || 'MANUAL VERIFICATION', classification, tacticalImpact: candidate.tacticalImpact || 'MANUAL VERIFICATION', pressureScore, aggression: ctx.sliders.aggression, controversy: ctx.sliders.controversy, diplomacy: ctx.sliders.diplomacy, length: ctx.sliders.length, wordCount, estimatedSeconds: speakingSeconds(wordCount), estimatedLines: ctx.lengthInfo?.lines || '≈ 1 line', followUp: ctx.includeFollowUp ? candidate.followUp : null, factCheck: { status: 'PENDING', confidence: 0, claims: [], legalAssessment: { status: 'UNCERTAIN', reason: '' }, classificationAssessment: { status: 'UNCERTAIN', reason: '' } }, pressureProfile: { ...ctx.sliders, score: pressureScore, classification }, legalTacticalTypes: [classification], classificationReason: candidate.classificationReason || classificationReason(classification), pressurePoint: { portfolioPosition: 'MANUAL VERIFICATION', targetPositionAction: candidate.documentedIssue || 'MANUAL VERIFICATION', conflict: candidate.documentedIssue || 'MANUAL VERIFICATION', agendaRelevance: candidate.tacticalImpact || 'MANUAL VERIFICATION' } };
+  return { id: `poi-${index + 1}`, pressurePointId: candidate.pressurePointId || candidate.pressure_point_id || candidate.pressurePoint?.id || '', target: candidate.target || 'AUTO-DISCOVERED TARGET', poi: poiText, legalFoundation: candidate.legalFoundation || 'MANUAL VERIFICATION', legalPolicyFoundation: candidate.legalFoundation || 'MANUAL VERIFICATION', evidence, documentedIssue: candidate.documentedIssue || 'MANUAL VERIFICATION', classification, tacticalImpact: normalizeTacticalImpact(candidate, ctx, classification, pressureScore), pressureScore, aggression: ctx.sliders.aggression, controversy: ctx.sliders.controversy, diplomacy: ctx.sliders.diplomacy, length: ctx.sliders.length, wordCount, estimatedSeconds: speakingSeconds(wordCount), estimatedLines: ctx.lengthInfo?.lines || '≈ 1 line', followUp: ctx.includeFollowUp ? candidate.followUp : null, factCheck: { status: 'PENDING', confidence: 0, claims: [], legalAssessment: { status: 'UNCERTAIN', reason: '' }, classificationAssessment: { status: 'UNCERTAIN', reason: '' } }, pressureProfile: { ...ctx.sliders, score: pressureScore, classification }, legalTacticalTypes: [classification], classificationReason: candidate.classificationReason || classificationReason(classification), pressurePoint: { portfolioPosition: 'MANUAL VERIFICATION', targetPositionAction: candidate.documentedIssue || 'MANUAL VERIFICATION', conflict: candidate.documentedIssue || 'MANUAL VERIFICATION', agendaRelevance: candidate.tacticalImpact || 'MANUAL VERIFICATION' } };
 }
 
 export function validatePoi(poi) { return !!stripMarkdown(poi?.poi || '').trim(); }

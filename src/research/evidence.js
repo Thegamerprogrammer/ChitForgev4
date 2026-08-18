@@ -145,7 +145,7 @@ export function compactResearchReferences(points = [], evidence = []) {
 
 export function compactVerifiedPressurePointReferences(points = [], evidence = []) {
   const byId = new Map(evidence.map((ev) => [ev.evidenceId || ev.id, ev]));
-  return points.map((point) => ({ pressurePointId: point.id, claim: point.claim, relevance: point.relevance || point.evidenceExcerpt || point.scores?.agendaRelevance ? `Relevant to ${point.target || 'target'} and agenda pressure because the verified claim is tied to supplied retrieved evidence.` : '', evidenceIds: point.evidenceIds || [], sourceUrls: (point.evidenceIds || []).map((id) => byId.get(id)?.url).filter(Boolean) }));
+  return points.map((point) => ({ pressurePointId: point.id, target: point.target || '', claim: point.claim, legalFoundation: point.legalFoundation || '', pressurePointCategory: point.pressurePointCategory || point.type || '', tacticalImpact: point.tacticalImpact || '', relevance: point.relevance || point.evidenceExcerpt || point.scores?.agendaRelevance ? `Relevant to ${point.target || 'target'} and agenda pressure because the verified claim is tied to supplied retrieved evidence.` : '', evidenceIds: point.evidenceIds || [], sourceUrls: (point.evidenceIds || []).map((id) => byId.get(id)?.url).filter(Boolean) }));
 }
 
 export function compactPressurePointsForModel(points = [], evidence = [], { maxEvidencePerPoint = 2 } = {}) {
