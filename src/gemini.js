@@ -1,3 +1,4 @@
+import { GoogleGenAI, createPartFromUri } from '@google/genai';
 import { extractGeminiText } from './responseParser.js';
 import { CHITFORGE_RESPONSE_SCHEMA, FOLLOW_UP_RESPONSE_SCHEMA, FACT_CHECK_RESPONSE_SCHEMA, classifyDiscoveredModel, compatibleModels, rankModels, selectBest, selectFactCheckModel, selectSmartRotation, MODEL_SELECTION_MODES } from './modelSelection.js';
 
@@ -80,9 +81,26 @@ export async function discoverGeminiModels(apiKey, { force = false } = {}) {
   return result;
 }
 
-export function geminiInlineDataPart(file) {
+const uploadedFileCache = new Map();
+function base64ToBlob(base64, mimeType) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: mimeType || 'application/octet-stream' });
+}
+export async function uploadGeminiFile(apiKey, file) {
   if (!file?.base64) return null;
-  return { inlineData: { mimeType: file.mimeType || 'application/octet-stream', data: file.base64 } };
+  const key = `${file.name || 'guide'}:${file.mimeType || ''}:${file.base64.length}`;
+  if (uploadedFileCache.has(key)) return uploadedFileCache.get(key);
+  const ai = new GoogleGenAI({ apiKey });
+  const uploaded = await ai.files.upload({ file: base64ToBlob(file.base64, file.mimeType), config: { mimeType: file.mimeType || 'application/octet-stream', displayName: file.name || 'background-guide' } });
+  uploadedFileCache.set(key, uploaded);
+  return uploaded;
+}
+export async function geminiFileDataPart(apiKey, file) {
+  const uploaded = await uploadGeminiFile(apiKey, file);
+  if (!uploaded?.uri) return null;
+  return createPartFromUri(uploaded.uri, uploaded.mimeType || file?.mimeType || 'application/octet-stream');
 }
 
 function buildBody(prompt, schema, model, { nativeJson = true, requestParts = [] } = {}) {

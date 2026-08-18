@@ -9,7 +9,6 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "test:parser": "node src/responseParser.test.mjs",
-    "research:proxy": "node proxy/researchProxy.js",
     "test:research": "node src/research/evidence.test.mjs",
     "test": "npm run test:parser && npm run test:research && npm run test:model-evidence && npm run test:budget && npm run test:compact-payload",
     "test:budget": "node src/geminiBudget.test.mjs",

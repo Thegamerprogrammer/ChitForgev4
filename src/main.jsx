@@ -108,7 +108,7 @@ function App() {
       setModelInfo(result.modelInfo || null);
       setResearchPacket(result.researchPacket || null);
       if (result.chits.length < poiCount && mode !== 'selected_only') setError({ message: `${result.chits.length} / ${poiCount} POIs generated. Gemini did not return enough distinct, defensible POIs after retry attempts. No duplicates were inserted.` });
-      if (!result.chits.length) setError({ message: result.researchPacket?.status === 'RESEARCH UNAVAILABLE' ? (result.researchPacket?.raw?.warning || 'Research proxy unavailable') : result.researchPacket?.status === 'NO USABLE EVIDENCE' ? 'Search completed but no usable evidence survived validation.' : mode === 'selected_only' && !selected.length ? 'Selected Targets Only needs at least one selected target. Zero selected targets is valid in Selected + Global Research mode.' : 'No defensible targets discovered.' });
+      if (!result.chits.length) setError({ message: result.researchPacket?.status === 'RESEARCH UNAVAILABLE' ? (result.researchPacket?.raw?.warning || 'Research unavailable') : result.researchPacket?.status === 'NO USABLE EVIDENCE' ? 'Research completed but no usable evidence survived validation.' : mode === 'selected_only' && !selected.length ? 'Selected Targets Only needs at least one selected target. Zero selected targets is valid in Selected + Global Research mode.' : 'No defensible targets discovered.' });
     } catch (err) {
       showError(err);
     } finally {
@@ -150,7 +150,7 @@ function App() {
       const packet = await runResearchPacket({ form, missionState: missionStateForCurrentUi(), modelSelection, onProgress: pushProgress });
       setResearchPacket(packet);
       setPortfolioProfile(packet.raw?.portfolioProfile || packet.raw?.portfolio_profile || null);
-      setError({ message: packet.status === 'READY' ? `Research packet ready with ${(packet.raw?.pressurePoints || packet.raw?.pressure_points || []).length || 0} retrieved pressure point(s).` : packet.status === 'NO USABLE EVIDENCE' ? 'Search completed but no usable evidence survived validation.' : (packet.raw?.warning || 'Research proxy unavailable') });
+      setError({ message: packet.status === 'READY' ? `Research packet ready with ${(packet.raw?.pressurePoints || packet.raw?.pressure_points || []).length || 0} retrieved pressure point(s).` : packet.status === 'NO USABLE EVIDENCE' ? 'Research completed but no usable evidence survived validation.' : (packet.raw?.warning || 'Research unavailable') });
     } catch (err) { showError(err); } finally { setBusy(false); setStatus(null); }
   };
   const runReviewCurrent = async () => {

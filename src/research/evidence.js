@@ -59,7 +59,7 @@ function independentKey(ev) {
   return wire ? `wire:${wire}` : domain;
 }
 function dateAfter(date, freezeDate) { if (!date || !freezeDate) return false; const a = Date.parse(date); const b = Date.parse(freezeDate); return Number.isFinite(a) && Number.isFinite(b) && a > b; }
-export function normalizeEvidence({ results = [], documents = [], missionState = {}, provider = 'searxng' } = {}) {
+export function normalizeEvidence({ results = [], documents = [], missionState = {}, provider = 'gemini-original-research' } = {}) {
   const byUrl = new Map(documents.map((d) => [canonicalUrl(d.url), d]));
   return dedupeResultsByUrl(results).map((result, index) => {
     const doc = byUrl.get(canonicalUrl(result.url)); const text = doc?.text || '';

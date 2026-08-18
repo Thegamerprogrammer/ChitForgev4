@@ -1,10 +1,8 @@
-import { callGemini, callFactCheck, repairJsonWithGemini, GeminiError, CHITFORGE_RESPONSE_SCHEMA, FOLLOW_UP_RESPONSE_SCHEMA, geminiInlineDataPart } from './gemini.js';
+import { callGemini, callFactCheck, repairJsonWithGemini, GeminiError, CHITFORGE_RESPONSE_SCHEMA, FOLLOW_UP_RESPONSE_SCHEMA, geminiFileDataPart } from './gemini.js';
 import { assertPortfolioSafety, findDuplicatePoiIndexes, INTERNAL_POI_CEILING } from './validation.js';
 import { toInternalMission, validateInternalMission, extractJson } from './responseParser.js';
 import { applyFactCheckToSources, validateSources } from './sourceValidation.js';
-import { planResearchQueries } from './research/planner.js';
-import { searchWithProvider, fetchDocuments } from './research/proxyClient.js';
-import { normalizeEvidence, hasUsablePressurePointEvidence as hasProviderEvidence, RESEARCH_STATUS, buildModelEvidence, compactResearchReferences, compactVerifiedPressurePointReferences } from './research/evidence.js';
+import { hasUsablePressurePointEvidence as hasProviderEvidence, RESEARCH_STATUS, compactResearchReferences, compactVerifiedPressurePointReferences } from './research/evidence.js';
 
 export const MASTER_SYSTEM_PROMPT = `You are a ruthless but strictly evidence-based Model United Nations strategist who writes like a sharp floor delegate, not like an AI.
 Write only punchy, natural, spoken-English Points of Information. No robotic phrasing. No academic padding. No ceremonial openings. No “Distinguished Delegate”.
@@ -101,53 +99,74 @@ function keepBest(chits, researchPacket, totalPois) {
   return [...main.sort(sorter).filter((poi) => poi.review?.status === 'PASS').slice(0, totalPois), ...extras.sort(sorter)];
 }
 
+function promptSafeMissionState(missionState) { const { backgroundGuideFile, ...rest } = missionState || {}; return { ...rest, backgroundGuideFile: backgroundGuideFile ? { name: backgroundGuideFile.name, mimeType: backgroundGuideFile.mimeType, size: backgroundGuideFile.size || null } : null }; }
 function researchKey(form, missionState) { return JSON.stringify({ agenda: form.agenda, portfolio: missionState.portfolioCountry, freezeDate: missionState.freezeDate, notes: hash(missionState.researchNotes), guide: hash(missionState.backgroundGuideFile?.name || missionState.backgroundGuideText), links: missionState.researchLinks, targets: missionState.oppositionCountries.map((c) => c.iso || c.name).sort() }); }
+function evidenceFromResearchPoints(rawPoints = [], missionState = {}) {
+  const evidence = [];
+  const byUrl = new Map();
+  for (const point of rawPoints) {
+    const url = sourceUrl(point);
+    if (!hasRealUrl(url)) continue;
+    const key = url.replace(/#.*$/, '').replace(/\/$/, '').toLowerCase();
+    if (!byUrl.has(key)) {
+      const id = `ev-${String(evidence.length + 1).padStart(3, '0')}`;
+      byUrl.set(key, id);
+      evidence.push({
+        id,
+        title: point.sourceName || point.source_name || point.title || '',
+        url,
+        domain: (() => { try { return new URL(url).hostname.replace(/^www\./i, '').toLowerCase(); } catch { return ''; } })(),
+        provider: 'gemini-original-research',
+        snippet: pointEvidence(point),
+        excerpt: pointEvidence(point),
+        retrievedAt: new Date().toISOString(),
+        publishedAt: point.publicationDate || point.publication_date || null,
+        fetchStatus: 'ok',
+        sourceQuality: { tier: hasRealUrl(url) ? 'established_secondary' : 'rejected', score: hasRealUrl(url) ? 78 : 0, flags: [] },
+        relevance: { target: true, portfolio: true, committee: true, agenda: true },
+        retrievedFromSearch: true,
+        hasUsableContent: pointEvidence(point).length >= 20,
+      });
+    }
+  }
+  if (missionState.freezeDate) {
+    for (const ev of evidence) {
+      const afterFreeze = ev.publishedAt && Date.parse(ev.publishedAt) > Date.parse(missionState.freezeDate);
+      if (afterFreeze) ev.sourceQuality.flags.push('published-after-freeze-date');
+    }
+  }
+  return { evidence, idForUrl: (url) => byUrl.get(String(url || '').replace(/#.*$/, '').replace(/\/$/, '').toLowerCase()) };
+}
+
+function attachEvidenceIds(rawPoints = [], idForUrl) {
+  return rawPoints.map((point, index) => {
+    const existing = Array.isArray(point.evidenceIds) ? point.evidenceIds : [];
+    const id = idForUrl(sourceUrl(point));
+    return { ...point, id: point.id || point.pressurePointId || `pp-${String(index + 1).padStart(3, '0')}`, evidenceIds: existing.length ? existing : (id ? [id] : []), claimSupported: point.claimSupported ?? !/MANUAL VERIFICATION|UNVERIFIED|NOT VERIFIED/i.test(String(point.verificationStatus || point.status || 'VERIFIED')), verificationStatus: point.verificationStatus || point.status || 'VERIFIED' };
+  });
+}
+
 export async function runResearchPacket({ form, missionState, modelSelection, onProgress }) {
   const key = researchKey(form, missionState); if (researchCache.has(key)) return researchCache.get(key);
+  stage(onProgress, 'Researching Pressure Points', 'RUNNING', 'Using original Gemini research prompt to identify source-backed pressure points without external search tools.', 0, 1);
   const params = assertRuntime(missionState, runtimeParams(missionState, missionState.oppositionCountries.map((c) => c.name).join(', ') || 'GLOBAL'));
-  stage(onProgress, 'Researching Pressure Points', 'RUNNING', 'Planning bounded SearXNG research queries without Gemini Search tools.', 0, Math.max(1, missionState.totalPois));
-  let planned, searchPacket, documents, evidence;
+  const prompt = `${MASTER_SYSTEM_PROMPT}\nReturn JSON only. Build a research packet with portfolioProfile and pressurePoints[]. Use the original Gemini research process: reason from the supplied mission, research notes, research links, and background-guide context. Do not enable web-search tools. Do not fabricate sources; if a source URL/title/date cannot be confidently provided, mark that item MANUAL VERIFICATION instead of inventing it. Respect the freeze date and reject events/publications after it.\nRUNTIME PARAMETERS: ${JSON.stringify(params)}\nCOMMITTEE:${form.committee}\nAGENDA:${form.agenda}\nPORTFOLIO:${missionState.portfolioCountry}\nTARGETS:${JSON.stringify(missionState.oppositionCountries)}\nRESEARCH NOTES:${missionState.researchNotes}\nRESEARCH LINKS:${missionState.researchLinks.join('\n')}\nBACKGROUND GUIDE:${missionState.backgroundGuideFile ? `Attached as Gemini file reference (${missionState.backgroundGuideFile.name || 'uploaded guide'}). Use as context only, not proof.` : missionState.backgroundGuideText.slice(0, 8000)}\nFREEZE DATE:${missionState.freezeDate}\nFind scandals/controversies and verified historical bad events separately. Each pressure point needs id,type,target,eventDate,sourceName,organization,url,publicationDate,claim,evidenceExcerpt,agendaRelevance,portfolioRelevance,legalRelevance,verificationStatus.`;
   try {
-    planned = await planResearchQueries({ form, missionState: { ...missionState, committee: form.committee, agenda: form.agenda }, modelSelection });
-    stage(onProgress, 'Researching Pressure Points', 'RUNNING', `Searching SearXNG with ${planned.queries.length} deduplicated querie(s).`, 1, Math.max(1, planned.queries.length));
-    searchPacket = await searchWithProvider(planned.queries, { maxResultsPerQuery: 8 });
-    const urls = searchPacket.results.map((r) => r.url).filter((url) => !/wikipedia\.org/i.test(url)).slice(0, 10);
-    stage(onProgress, 'Researching Pressure Points', 'RUNNING', `Fetching ${urls.length} selected source page(s).`, 0, Math.max(1, urls.length));
-    documents = await fetchDocuments(urls);
-    evidence = normalizeEvidence({ results: searchPacket.results, documents, missionState: { ...missionState, committee: form.committee, agenda: form.agenda }, provider: searchPacket.provider });
+    const guidePart = await geminiFileDataPart(form.apiKey, missionState.backgroundGuideFile);
+    const response = await callGemini(form.apiKey, prompt, { ...modelSelection, requestParts: guidePart ? [guidePart] : [], schema: null, nativeJson: false, requestContext: { stage: 'Researching Pressure Points', operation: 'original-gemini-research' } });
+    const raw = extractJson(response.text);
+    const rawPoints = Array.isArray(raw?.pressurePoints) ? raw.pressurePoints : Array.isArray(raw?.pressure_points) ? raw.pressure_points : [];
+    const { evidence, idForUrl } = evidenceFromResearchPoints(rawPoints, missionState);
+    const derived = deriveResearchPacket({ ...raw, pressurePoints: attachEvidenceIds(rawPoints, idForUrl) }, evidence, missionState, RESEARCH_STATUS.READY);
+    const packet = { ...derived, provider: 'gemini-original-research', model: response.model, missionState, cacheKey: key, createdAt: new Date().toISOString() };
+    setCandidatePoolSize(packet, missionState.totalPois);
+    stage(onProgress, 'Researching Pressure Points', packet.status === RESEARCH_STATUS.READY ? 'COMPLETE' : 'FAILED', packet.status === RESEARCH_STATUS.READY ? `${packet.availableVerifiedPressurePoints.length} verified pressure point(s).` : 'Gemini research returned no usable verified evidence.', packet.availableVerifiedPressurePoints.length, Math.max(packet.rankedPressurePoints.length, 1));
+    researchCache.set(key, packet); return packet;
   } catch (error) {
-    const message = error.category === 'searxng-unavailable' ? 'SearXNG unavailable' : 'Research proxy unavailable';
-    const packet = { status: RESEARCH_STATUS.UNAVAILABLE, raw: { status: RESEARCH_STATUS.UNAVAILABLE, pressurePoints: [], warning: message, providerError: error.message }, rankedPressurePoints: [], availableVerifiedPressurePoints: [], candidatePoolSize: 0, evidence: [], model: null, cacheKey: key, createdAt: new Date().toISOString() };
-    stage(onProgress, 'Researching Pressure Points', 'FAILED', `${message}: ${error.message}`, 0, 1);
+    const packet = { status: RESEARCH_STATUS.UNAVAILABLE, raw: { status: RESEARCH_STATUS.UNAVAILABLE, pressurePoints: [], warning: 'Original Gemini research unavailable', providerError: error.message }, rankedPressurePoints: [], availableVerifiedPressurePoints: [], candidatePoolSize: 0, evidence: [], provider: 'gemini-original-research', model: error.model || null, missionState, cacheKey: key, createdAt: new Date().toISOString() };
+    stage(onProgress, 'Researching Pressure Points', 'FAILED', `Original Gemini research unavailable: ${error.message}`, 0, 1);
     researchCache.set(key, packet); return packet;
   }
-  const modelEvidence = buildModelEvidence(evidence);
-  const analysisPayload = { runtimeParameters: params, committee: form.committee, agenda: form.agenda, portfolio: missionState.portfolioCountry, targets: missionState.oppositionCountries, evidence: modelEvidence };
-  const analysisPrompt = `${MASTER_SYSTEM_PROMPT}
-MISSION AND EVIDENCE PAYLOAD:${JSON.stringify(analysisPayload)}
-TASK: Return JSON only. Analyze ONLY the supplied retrieved evidence records. Each record contains evidenceId, original URL, source quality, publication date, and bounded extracted text. Do not use model memory. Do not invent evidence. Do not invent URLs. Do not invent evidence IDs. Every pressure point must reference evidenceIds that exist in EVIDENCE. Set claimSupported true only when the extracted text supports the claim. A SearXNG search snippet alone is insufficient evidence. Wikipedia cannot be used as evidence. If no defensible pressure points exist, return an empty pressurePoints array.
-Each pressure point needs id,type,target,eventDate,sourceName,organization,publicationDate,claim,evidenceExcerpt,evidenceIds,claimSupported,agendaRelevance,portfolioRelevance,legalRelevance,verificationStatus.`;
-  let structured;
-  try {
-    structured = await callGemini(form.apiKey, analysisPrompt, { ...modelSelection, schema: null, requestContext: { stage: 'Researching Pressure Points', operation: 'searxng-evidence-analysis' } });
-  } catch (error) {
-    const packet = { status: RESEARCH_STATUS.UNAVAILABLE, raw: { status: RESEARCH_STATUS.UNAVAILABLE, pressurePoints: [], warning: 'Malformed/invalid research response', providerError: error.message }, rankedPressurePoints: [], availableVerifiedPressurePoints: [], candidatePoolSize: 0, evidence, provider: 'searxng', queries: planned.queries, model: error.model || null, missionState, cacheKey: key, createdAt: new Date().toISOString() };
-    stage(onProgress, 'Researching Pressure Points', 'FAILED', `Malformed/invalid research response: ${error.message}`, 0, 1);
-    researchCache.set(key, packet); return packet;
-  }
-  let parsed;
-  try { parsed = extractJson(structured.text); }
-  catch (error) {
-    const packet = { status: RESEARCH_STATUS.UNAVAILABLE, raw: { status: RESEARCH_STATUS.UNAVAILABLE, pressurePoints: [], warning: 'Malformed/invalid research response', providerError: error.message }, rankedPressurePoints: [], availableVerifiedPressurePoints: [], candidatePoolSize: 0, evidence, provider: 'searxng', queries: planned.queries, model: structured.model, missionState, cacheKey: key, createdAt: new Date().toISOString() };
-    stage(onProgress, 'Researching Pressure Points', 'FAILED', `Malformed/invalid research response: ${error.message}`, 0, 1);
-    researchCache.set(key, packet); return packet;
-  }
-  const derived = deriveResearchPacket(parsed, evidence, missionState, RESEARCH_STATUS.READY);
-  const packet = { ...derived, provider: 'searxng', queries: planned.queries, model: structured.model, missionState, cacheKey: key, createdAt: new Date().toISOString() };
-  setCandidatePoolSize(packet, missionState.totalPois);
-  const detail = packet.status === RESEARCH_STATUS.READY ? `${packet.status}: ${packet.availableVerifiedPressurePoints.length} verified pressure point(s).` : 'Search completed but no usable evidence survived validation.';
-  stage(onProgress, 'Researching Pressure Points', packet.status === RESEARCH_STATUS.READY ? 'COMPLETE' : 'FAILED', detail, packet.availableVerifiedPressurePoints.length, Math.max(packet.rankedPressurePoints.length, 1));
-  researchCache.set(key, packet); return packet;
 }
 export async function generateMission({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount, poiTypes = ['AUTO'], customPoiType = '', poisPerOppositionCountry = 0, researchNotes = '', researchLinks = [], backgroundGuideText = '', backgroundGuideFile = null, freezeDate = '', easyLanguage = false, oppositionPriority = false, onProgress, modelSelection }) {
   const missionState = captureMissionState({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount, poisPerOppositionCountry, poiTypes, customPoiType, researchNotes, researchLinks, backgroundGuideText, backgroundGuideFile, freezeDate, easyLanguage, oppositionPriority, modelSelection });
@@ -162,7 +181,7 @@ export async function generateMission({ form, sliders, selectedTargets, targetin
   const rankedCandidatePool = candidatePoolFor(researchPacket, missionState.totalPois);
   stage(onProgress, 'Legal Frameworks', 'COMPLETE', `Ranked ${researchPacket.rankedPressurePoints.length} pressure point(s); ${rankedCandidatePool.length} verified candidate(s) eligible for generation.`, rankedCandidatePool.length, Math.max(1, researchPacket.rankedPressurePoints.length));
   const prompt = buildMissionPrompt({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount: missionState.totalPois, poiTypes: missionState.poiTypes, missionState, researchPacket, rankedCandidatePool });
-  const guidePart = geminiInlineDataPart(missionState.backgroundGuideFile);
+  const guidePart = await geminiFileDataPart(form.apiKey, missionState.backgroundGuideFile);
   const requestParts = guidePart ? [guidePart] : [];
   const params = assertRuntime(missionState, runtimeParams(missionState, oppositionOnly ? missionState.oppositionCountries.map((c) => c.name).join(', ') : 'GLOBAL/OPPOSITION'));
   const response = await callGemini(form.apiKey, `${prompt}\nRUNTIME PARAMETER ASSERTION:${JSON.stringify(params)}`, { ...modelSelection, requestParts, schema: CHITFORGE_RESPONSE_SCHEMA, requestContext: { stage: 'Generating Main POIs', operation: 'main-generation' }, onModelStatus: (status) => onProgress?.({ stage: 'Generating Main POIs', status: 'RUNNING', detail: `Using ${status.model.displayName}.`, done: 0, total: missionState.totalPois }) });
@@ -187,7 +206,7 @@ async function generateOppositionPois({ form, sliders, missionState, researchPac
   missionState.oppositionCountries.forEach((target) => assertPortfolioSafety({ portfolioCountry: missionState.portfolioCountry, targetCountry: target.name, oppositionCountries: missionState.oppositionCountries, oppositionOnly: true }));
   stage(onProgress, 'Per-Opposition POIs', 'RUNNING', `Generating ${missionState.poisPerOppositionCountry} opposition-tagged POIs for each selected opposition target with the shared ranked pool.`, 0, totalOppositionPois);
   const prompt = buildMissionPrompt({ form, sliders, selectedTargets: missionState.oppositionCountries, targetingMode: 'selected_only', includeFollowUp: missionState.includeFollowUp, poiCount: totalOppositionPois, poiTypes: missionState.poiTypes, missionState, researchPacket, rankedCandidatePool }) + `\nGenerate exactly ${missionState.poisPerOppositionCountry} oppositionTarget:true POI(s) per selected target when the ranked pool supports them. These are opposition extras and do not count against the main totalPois budget.`;
-  const guidePart = geminiInlineDataPart(missionState.backgroundGuideFile);
+  const guidePart = await geminiFileDataPart(form.apiKey, missionState.backgroundGuideFile);
   const res = await callGemini(form.apiKey, prompt, { ...modelSelection, requestParts: guidePart ? [guidePart] : [], schema: CHITFORGE_RESPONSE_SCHEMA, requestContext: { stage: 'Per-Opposition POIs', operation: 'opposition-generation-shared-pool' } });
   const m = await recoverMission({ apiKey: form.apiKey, text: res.text, ctx: { form, sliders, includeFollowUp: missionState.includeFollowUp, poiCount: totalOppositionPois, targetingMode: 'selected_only', poiTypes: missionState.poiTypes, lengthInfo: lengthInfo(sliders.length) }, modelSelection, modelInfo: { primaryModel: res.model.displayName } });
   return enforceSafetyAndDiversity(m.chits.map((poi) => attachPressurePointTrace(poi, researchPacket)), missionState, true).map((chit) => ({ ...chit, oppositionTarget: true }));
@@ -295,12 +314,12 @@ export function buildMissionPrompt({ form, sliders, selectedTargets, targetingMo
   return `${MASTER_SYSTEM_PROMPT}
 
 IMMUTABLE MISSION STATE:
-${missionState ? JSON.stringify(missionState) : 'LEGACY MODE'}
+${missionState ? JSON.stringify(promptSafeMissionState(missionState)) : 'LEGACY MODE'}
 
 BACKGROUND GUIDE:
-${missionState?.backgroundGuideFile ? `Attached once as native Gemini inlineData file/document input (${missionState.backgroundGuideFile.name || 'uploaded guide'}, ${missionState.backgroundGuideFile.mimeType || 'unknown type'}). It is context only, not evidence.` : missionState?.backgroundGuideText ? 'Uploaded guide text is available only as bounded context metadata because no native file bytes were supplied by the UI. It is context only, not evidence.' : 'No background guide supplied.'}
+${missionState?.backgroundGuideFile ? `Attached once as native Gemini fileData file/document input (${missionState.backgroundGuideFile.name || 'uploaded guide'}, ${missionState.backgroundGuideFile.mimeType || 'unknown type'}). It is context only, not evidence.` : missionState?.backgroundGuideText ? 'Uploaded guide text is available only as bounded context metadata because no native file bytes were supplied by the UI. It is context only, not evidence.' : 'No background guide supplied.'}
 
-VERIFIED RESEARCH REFERENCES (URL + exact one-line SearXNG result; provenance metadata only, not new factual authority):
+VERIFIED RESEARCH REFERENCES (URL + one-line source reference; provenance metadata only, not new factual authority):
 ${JSON.stringify(compactResearchReferences(rankedCandidatePool || candidatePoolFor(researchPacket, poiCount), researchPacket?.evidence || []))}
 
 VERIFIED PRESSURE-POINT REFERENCES (sole factual authority for POI content; use only these IDs; sorted best first; do not invent beyond it):
