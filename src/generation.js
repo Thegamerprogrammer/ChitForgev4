@@ -3,6 +3,7 @@ import { assertPortfolioSafety, findDuplicatePoiIndexes, INTERNAL_POI_CEILING } 
 import { toInternalMission, validateInternalMission, extractJson } from './responseParser.js';
 import { applyFactCheckToSources, validateSources } from './sourceValidation.js';
 import { hasUsablePressurePointEvidence as hasProviderEvidence, RESEARCH_STATUS, compactResearchReferences, compactVerifiedPressurePointReferences } from './research/evidence.js';
+import { annotatePressurePoint, researchPrioritySignals, rotateCandidatePool, sliderStyleProfile } from './tactical.js';
 
 export const MASTER_SYSTEM_PROMPT = `You are a ruthless but strictly evidence-based Model United Nations strategist who writes like a sharp floor delegate, not like an AI.
 Write only punchy, natural, spoken-English Points of Information. No robotic phrasing. No academic padding. No ceremonial openings. No “Distinguished Delegate”.
@@ -47,8 +48,12 @@ export function normalizePressurePoints(rawPoints = [], missionState = {}, evide
       legalHookPotential: scoreNumber(point.legalRelevance ?? point.legalHookPotential ?? point.scores?.legalHookPotential, 50),
       uniqueness: 70,
     };
-    const rankScore = Math.round(scores.agendaRelevance * 0.22 + scores.evidenceStrength * 0.28 + scores.portfolioAlignment * 0.17 + scores.controversyFit * 0.12 + scores.legalHookPotential * 0.14 + scores.uniqueness * 0.07);
-    return { id, rank: index + 1, rankScore, type: point.type || 'EVIDENCE TRAP', target: point.target || point.country || '', eventDate: point.eventDate || point.event_date || '', sourceName: point.sourceName || firstEvidence?.title || '', organization: point.organization || firstEvidence?.domain || '', url: firstEvidence?.url || sourceUrl(point), publicationDate: point.publicationDate || firstEvidence?.publishedAt || '', claim: point.claim || '', evidenceExcerpt: pointEvidence(point) || firstEvidence?.excerpt || '', evidenceIds: ids, verificationStatus: usable ? 'VERIFIED' : (point.verificationStatus || point.status || 'NOT VERIFIED'), scores, usableForGeneration: usable, raw: point };
+    const sliderProfile = sliderStyleProfile(missionState);
+    const controversyBoost = Math.max(0, sliderProfile.controversy - 50) * (scores.controversyFit / 100) * 0.08;
+    const aggressionBoost = Math.max(0, sliderProfile.aggression - 50) * (scores.legalHookPotential / 100) * 0.05;
+    const diplomacyBoost = Math.max(0, sliderProfile.diplomacy - 50) * (scores.legalHookPotential / 100) * 0.04;
+    const rankScore = Math.round(scores.agendaRelevance * 0.22 + scores.evidenceStrength * 0.28 + scores.portfolioAlignment * 0.17 + scores.controversyFit * 0.12 + scores.legalHookPotential * 0.14 + scores.uniqueness * 0.07 + controversyBoost + aggressionBoost + diplomacyBoost);
+    return annotatePressurePoint({ id, rank: index + 1, rankScore, type: point.type || 'EVIDENCE TRAP', target: point.target || point.country || '', eventDate: point.eventDate || point.event_date || '', sourceName: point.sourceName || firstEvidence?.title || '', organization: point.organization || firstEvidence?.domain || '', url: firstEvidence?.url || sourceUrl(point), publicationDate: point.publicationDate || firstEvidence?.publishedAt || '', claim: point.claim || '', legalFoundation: point.legalFoundation || point.legalPolicyFoundation || point.legal_basis || point.obligation || '', evidenceExcerpt: pointEvidence(point) || firstEvidence?.excerpt || '', evidenceIds: ids, contradictionEvidenceIds: point.contradictionEvidenceIds || point.contradiction_evidence_ids || [], verificationStatus: usable ? 'VERIFIED' : (point.verificationStatus || point.status || 'NOT VERIFIED'), scores, usableForGeneration: usable, raw: point }, missionState);
   }).sort((a, b) => b.rankScore - a.rankScore || a.id.localeCompare(b.id)).map((point, index) => ({ ...point, rank: index + 1 }));
 }
 export function deriveResearchPacket(raw, evidence, missionState, providerStatus = RESEARCH_STATUS.NO_USABLE_EVIDENCE) {
@@ -61,7 +66,7 @@ export function deriveResearchPacket(raw, evidence, missionState, providerStatus
 }
 function candidatePoolFor(researchPacket, totalPois) {
   const available = researchPacket?.availableVerifiedPressurePoints || [];
-  return available.slice(0, Math.min(available.length, Math.ceil(totalPois * 1.5)));
+  return rotateCandidatePool(available, totalPois).slice(0, Math.min(available.length, Math.ceil(totalPois * 2)));
 }
 function setCandidatePoolSize(researchPacket, totalPois) {
   const candidatePoolSize = candidatePoolFor(researchPacket, totalPois).length;
@@ -80,7 +85,7 @@ function hasPacketSupportForPoi(poi, point, researchPacket) {
 function attachPressurePointTrace(chit, researchPacket) {
   const point = packetPointById(researchPacket, chit.pressurePointId);
   if (!point) return { ...chit, review: { ...(chit.review || {}), status: 'NEEDS FIX', reason: 'POI is not traceable to a ranked pressure-point ID.' }, factCheck: { ...(chit.factCheck || {}), status: 'MANUAL VERIFICATION' } };
-  return { ...chit, pressurePointId: point.id, pressurePointRank: point.rank, pressurePoint: { ...(chit.pressurePoint || {}), id: point.id, targetPositionAction: chit.pressurePoint?.targetPositionAction || point.claim, conflict: chit.pressurePoint?.conflict || point.claim, agendaRelevance: chit.pressurePoint?.agendaRelevance || point.evidenceExcerpt }, evidence: (chit.evidence?.length ? chit.evidence : [{ sourceName: point.sourceName, organization: point.organization, publicationDate: point.publicationDate, url: point.url, claimSupported: point.claim, claim: point.claim, sourceType: 'OTHER_CREDIBLE', confidence: point.scores.evidenceStrength }]) };
+  return { ...chit, pressurePointId: point.id, pressurePointRank: point.rank, tacticalImpact: chit.tacticalImpact || point.tacticalImpact, legalFoundation: chit.legalFoundation || point.legalFoundation || 'MANUAL VERIFICATION', legalPolicyFoundation: chit.legalPolicyFoundation || chit.legalFoundation || point.legalFoundation || 'MANUAL VERIFICATION', legalTacticalTypes: [...new Set([...(chit.legalTacticalTypes || []), point.pressurePointCategory].filter(Boolean))], pressurePoint: { ...(chit.pressurePoint || {}), id: point.id, legalFoundation: point.legalFoundation, tacticalImpact: point.tacticalImpact, pressurePointCategory: point.pressurePointCategory, targetPositionAction: chit.pressurePoint?.targetPositionAction || point.claim, conflict: chit.pressurePoint?.conflict || point.claim, agendaRelevance: chit.pressurePoint?.agendaRelevance || point.evidenceExcerpt }, evidence: (chit.evidence?.length ? chit.evidence : [{ sourceName: point.sourceName, organization: point.organization, publicationDate: point.publicationDate, url: point.url, claimSupported: point.claim, claim: point.claim, sourceType: 'OTHER_CREDIBLE', confidence: point.scores.evidenceStrength }]) };
 }
 function keepBest(chits, researchPacket, totalPois) {
   const rankOf = (poi) => packetPointById(researchPacket, poi.pressurePointId)?.rank || 9999;
@@ -150,7 +155,7 @@ export async function runResearchPacket({ form, missionState, modelSelection, on
   const key = researchKey(form, missionState); if (researchCache.has(key)) return researchCache.get(key);
   stage(onProgress, 'Researching Pressure Points', 'RUNNING', 'Using original Gemini research prompt to identify source-backed pressure points without external search tools.', 0, 1);
   const params = assertRuntime(missionState, runtimeParams(missionState, missionState.oppositionCountries.map((c) => c.name).join(', ') || 'GLOBAL'));
-  const prompt = `${MASTER_SYSTEM_PROMPT}\nReturn JSON only. Build a research packet with portfolioProfile and pressurePoints[]. Use the original Gemini research process: reason from the supplied mission, research notes, research links, and background-guide context. Do not enable web-search tools. Do not fabricate sources; if a source URL/title/date cannot be confidently provided, mark that item MANUAL VERIFICATION instead of inventing it. Respect the freeze date and reject events/publications after it.\nRUNTIME PARAMETERS: ${JSON.stringify(params)}\nCOMMITTEE:${form.committee}\nAGENDA:${form.agenda}\nPORTFOLIO:${missionState.portfolioCountry}\nTARGETS:${JSON.stringify(missionState.oppositionCountries)}\nRESEARCH NOTES:${missionState.researchNotes}\nRESEARCH LINKS:${missionState.researchLinks.join('\n')}\nBACKGROUND GUIDE:${missionState.backgroundGuideFile ? `Attached as Gemini file reference (${missionState.backgroundGuideFile.name || 'uploaded guide'}). Use as context only, not proof.` : missionState.backgroundGuideText.slice(0, 8000)}\nFREEZE DATE:${missionState.freezeDate}\nFind scandals/controversies and verified historical bad events separately. Each pressure point needs id,type,target,eventDate,sourceName,organization,url,publicationDate,claim,evidenceExcerpt,agendaRelevance,portfolioRelevance,legalRelevance,verificationStatus.`;
+  const prompt = `${MASTER_SYSTEM_PROMPT}\nReturn JSON only. Build a research packet with portfolioProfile and pressurePoints[]. Use the original Gemini research process: reason from the supplied mission, research notes, research links, and background-guide context. Do not enable web-search tools. Do not fabricate sources; if a source URL/title/date cannot be confidently provided, mark that item MANUAL VERIFICATION instead of inventing it. Respect the freeze date and reject events/publications after it.\nRUNTIME PARAMETERS: ${JSON.stringify(params)}\nCOMMITTEE:${form.committee}\nAGENDA:${form.agenda}\nPORTFOLIO:${missionState.portfolioCountry}\nTARGETS:${JSON.stringify(missionState.oppositionCountries)}\nRESEARCH NOTES:${missionState.researchNotes}\nRESEARCH LINKS:${missionState.researchLinks.join('\n')}\nBACKGROUND GUIDE:${missionState.backgroundGuideFile ? `Attached as Gemini file reference (${missionState.backgroundGuideFile.name || 'uploaded guide'}). Use as context only, not proof.` : missionState.backgroundGuideText.slice(0, 8000)}\nFREEZE DATE:${missionState.freezeDate}\nSLIDER RESEARCH PRIORITIES:${researchPrioritySignals(missionState).join(', ')}\nAnalyze each candidate by asking: what did the target actually do; what evidence proves it; what obligation/commitment/policy is relevant; is there a contradiction; what is the strongest defensible attack angle; what tactical impact fits; what question would force an answer. Discard candidates lacking evidence. Sliders change discovery priority only and never lower the evidence threshold.\nFind scandals/controversies and verified historical bad events separately. Each pressure point needs id,type,target,eventDate,sourceName,organization,url,publicationDate,claim,evidenceExcerpt,legalFoundation,agendaRelevance,portfolioRelevance,legalRelevance,controversyFit,verificationStatus.`;
   try {
     const guidePart = await geminiFileDataPart(form.apiKey, missionState.backgroundGuideFile);
     const response = await callGemini(form.apiKey, prompt, { ...modelSelection, requestParts: guidePart ? [guidePart] : [], schema: null, nativeJson: false, requestContext: { stage: 'Researching Pressure Points', operation: 'original-gemini-research' } });
@@ -274,12 +279,12 @@ function buildReviewSupport(chits, researchPacket) {
 async function runFactChecks({ mission, form, apiKey, primaryModel, modelSelection, onProgress, researchPacket, missionState }) {
   try {
     const prompt = `Return JSON only: {"reviews":[{"id":"poi-1","status":"PASS|NEEDS FIX|FAIL","reason":"short","sourceQuality":"PRIMARY|HIGH|GOOD|LIMITED","trapStrength":"one-liner"}]}.
-Evidence-backed review must use the supplied research packet/source metadata/excerpts. Do not decide truth from model memory. PASS only if source evidence supports the POI. Do not perform new full research.
+Evidence-backed review must use the supplied research packet/source metadata/excerpts. Do not decide truth from model memory. PASS only if source evidence supports the POI. Do not perform new full research. Explicitly evaluate tacticalImpact correctness, legalFoundation correctness, claim/evidence alignment, contradiction validity, question relevance, target correctness, and tone vs slider settings. FAIL when the alleged fact is unsupported, legal foundation does not apply, contradiction is not real, source does not support the claim, or target is wrong.
 MISSION STATE:${JSON.stringify({ portfolioCountry: missionState?.portfolioCountry, aggression: missionState?.aggression, controversy: missionState?.controversy, diplomacy: missionState?.diplomacy, length: missionState?.length, freezeDate: missionState?.freezeDate })}
 AGENDA:${form.agenda}
 PORTFOLIO:${form.portfolio}
 RESEARCH SUPPORT:${JSON.stringify(buildReviewSupport(mission.chits, researchPacket))}
-POIS:${JSON.stringify(mission.chits.map((c, i) => ({ id: c.id || `poi-${i + 1}`, pressurePointId: c.pressurePointId, target: c.target, poi: c.poi, pressurePoint: c.pressurePoint, legalFoundation: c.legalFoundation || c.legalPolicyFoundation, evidence: c.evidence })))};`;
+POIS:${JSON.stringify(mission.chits.map((c, i) => ({ id: c.id || `poi-${i + 1}`, pressurePointId: c.pressurePointId, target: c.target, poi: c.poi, pressurePoint: c.pressurePoint, legalFoundation: c.legalFoundation || c.legalPolicyFoundation, tacticalImpact: c.tacticalImpact, classification: c.classification, evidence: c.evidence })))};`;
     stage(onProgress, 'Review', 'RUNNING', `Batch reviewing ${mission.chits.length} POIs against stored evidence.`, 0, mission.chits.length);
     const res = await callFactCheck(apiKey, prompt, { primaryModelId: primaryModel.id, modelSelection });
     const parsed = extractJson(res.text);
@@ -311,6 +316,7 @@ function diplomacyInstruction(value) { return band(value, [[10, 'Use blunt, dire
 export function buildMissionPrompt({ form, sliders, selectedTargets, targetingMode, includeFollowUp, poiCount, poiTypes = ['AUTO'], missionState = null, researchPacket = null, rankedCandidatePool = null }) {
   const manualTargets = selectedTargets.map((c) => `${c.name} (${c.iso})`).join(', ') || 'NONE — target countries are optional; identify useful targets globally if target mode allows.';
   const info = lengthInfo(sliders.length);
+  const styleProfile = sliderStyleProfile(sliders);
   return `${MASTER_SYSTEM_PROMPT}
 
 IMMUTABLE MISSION STATE:
@@ -355,6 +361,9 @@ ${sliders.diplomacy}/100
 LENGTH:
 ${sliders.length}/100
 
+SLIDER INTERACTION INSTRUCTION:
+${styleProfile.generationInstruction}
+
 TARGET WORD RANGE:
 ${info.words}
 
@@ -385,7 +394,7 @@ Diplomacy controls wording. ${diplomacyInstruction(sliders.diplomacy)}
 
 Length controls legal density + hook density, zero fluff: ${lengthDensityInstruction(sliders.length)} Stay approximately within ${info.words} and ${info.lines}. Do not add filler.
 
-The ideal POI should expose a documented contradiction, obligation, commitment, policy failure or controversy that makes a clean evasive answer difficult.
+The ideal POI should usually follow VERIFIED FACT + RELEVANT LEGAL/POLICY/COMMITMENT CONNECTION + TACTICAL CONTRADICTION + POINTED QUESTION. Vary wording. Use endings such as justify, reconcile, explain the discrepancy, or identify specific steps. The ideal POI should expose a documented contradiction, obligation, commitment, policy failure or controversy that makes a clean evasive answer difficult.
 
 Do not claim a question is literally impossible to answer.
 
@@ -430,7 +439,7 @@ Use authoritative legal sources where relevant: UN Charter, UNSC resolutions, UN
 
 Use reputable external sources for documented controversies: Reuters, AP, Financial Times, Bloomberg, BBC, Al Jazeera, major established newspapers, credible investigative organizations, academic publications, and established research institutions. Avoid random blogs, unsourced sites, anonymous claims, social media as primary evidence, AI-generated sources, and Wikipedia as primary evidence.
 
-Generate up to ${poiCount} distinct POIs from the verified pressure-point references only. Fewer is acceptable if evidence is thin. Every POI must include pressurePointId copied exactly from one candidate pool item. No duplicates. Each POI should preferably attack a different contradiction, commitment, legal issue, evidence point, implementation failure, policy issue, or financial issue.
+Generate up to ${poiCount} distinct POIs from the verified pressure-point references only. Fewer is acceptable if evidence is thin. Every POI must include pressurePointId copied exactly from one candidate pool item. No duplicates. Rotate targets intelligently across the verified pool and vary attack angles per target (LEGAL, POLICY, DIPLOMATIC, ECONOMIC, COMMITMENT, CONTRADICTION, IMPLEMENTATION FAILURE, TACTICAL). Do not let one target monopolize the output unless the verified candidate pool overwhelmingly supports it. Tactical traps require evidence for both sides of the contradiction. Each POI should preferably attack a different contradiction, commitment, legal issue, evidence point, implementation failure, policy issue, or financial issue.
 
 Important concepts may be emphasized with Markdown-style bold markers around short phrases only.
 

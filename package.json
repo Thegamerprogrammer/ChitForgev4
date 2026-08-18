@@ -10,10 +10,11 @@
     "preview": "vite preview",
     "test:parser": "node src/responseParser.test.mjs",
     "test:research": "node src/research/evidence.test.mjs",
-    "test": "npm run test:parser && npm run test:research && npm run test:model-evidence && npm run test:budget && npm run test:compact-payload",
+    "test": "npm run test:parser && npm run test:research && npm run test:model-evidence && npm run test:budget && npm run test:compact-payload && npm run test:tactical",
     "test:budget": "node src/geminiBudget.test.mjs",
     "test:model-evidence": "node src/research/modelEvidence.test.mjs",
-    "test:compact-payload": "node src/research/compactPayload.test.mjs"
+    "test:compact-payload": "node src/research/compactPayload.test.mjs",
+    "test:tactical": "node src/tactical.test.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.16.0",
