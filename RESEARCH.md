@@ -1,61 +1,24 @@
 # ChitForge research architecture
 
-ChitForge separates search/retrieval from Gemini reasoning. Gemini is used only as planner, evidence analyst, generator, fact-checker, and reviewer; active Gemini Google Search grounding/tools are not constructed.
-
-## Local services
-
-Configure local research with:
-
-```env
-RESEARCH_PROXY_PORT=8787
-SEARXNG_BASE_URL=http://localhost:8080
-VITE_RESEARCH_PROXY_URL=http://localhost:8787
-```
-
-Self-hosting SearXNG is recommended. The proxy calls the official JSON endpoint (`/search?q=...&format=json`), so the SearXNG instance must enable JSON responses. Public instances can be unreliable and should not be assumed available.
+ChitForge uses the original Gemini-based research flow as its baseline. The app asks Gemini to produce a structured research packet from the mission, research notes, user-supplied research links, freeze date, selected opposition targets, and optional background-guide context. It does not configure any local retrieval proxy or external search backend/tool.
 
 ## Pipeline
 
-Mission input flows through:
-
-1. Gemini planner returns 6–12 search queries only; it receives slider values as research-priority signals.
-2. Browser calls the research proxy.
-3. Proxy queries SearXNG and returns real results only: title, URL, snippet, engine, query.
-4. Proxy fetches capped http/https URLs with SSRF protections, timeouts, redirects, and response-size limits.
-5. App normalizes evidence into source-quality, relevance, excerpt, retrieved URL, and fetch status.
-6. Gemini may analyze claims against actual retrieved excerpts, but application code performs the final evidence gate.
-7. Only verified pressure points enter the ranked candidate pool.
-8. Main generation receives a compact payload: mission, generation settings, verified research references, verified pressure-point references, requested `up to N`, and the background guide as a native file/document part when available.
-9. Provenance is preserved as POI → pressurePointId → evidenceIds → retrieved source URL.
-10. Fact-check/review receives only each POI and relevant verified support, not the full research database.
+1. Mission state captures portfolio, agenda, selected/global targeting mode, opposition countries, sliders, research notes, research links, freeze date, easy-language preference, POI count, and background-guide file metadata.
+2. Gemini returns a JSON research packet containing `portfolioProfile` and `pressurePoints` with real source metadata when it can provide it.
+3. ChitForge normalizes the pressure points into ranked candidates while preserving `pressurePointId`, `evidenceIds`, source URL, title/source identity, publication date, and evidence excerpt.
+4. Generation receives only compact source and pressure-point references, plus the background guide as a Gemini File API reference when a file is uploaded.
+5. Review checks generated POIs against the stored research packet and pressure-point evidence relationships.
+6. `keepBest` ranks reviewed POIs without fabricating filler.
 
 ## Evidence rules
 
-SearXNG snippets are discovery only. A pressure point is verified only when it has a real search result URL, a successful fetch, usable source text, supported claim status, acceptable source quality, relevance, and freeze-date compliance where a publication date is known.
-
-Wikipedia is discovery-only and never qualifies as verified evidence. Failed fetches, missing evidence IDs, snippet-only records, model-invented URLs, and unsupported or partially supported claims are rejected.
-
-Source quality is deterministic first:
-
-- `PRIMARY`: governments, courts, central banks, international organizations, treaty bodies, official statistics/reports.
-- `SECONDARY`: established journalism and research/academic organizations.
-- `OTHER/REJECT`: blogs, social media, random aggregators, missing/fabricated URLs, Wikipedia, or unusable fetched content.
-
-Serious or materially damaging claims require either one strong primary source or two independent credible sources. The same publisher twice, or duplicate wire coverage, is not independent corroboration.
+The model must not invent URLs, titles, dates, quotations, statistics, sources, or citations. If a claim cannot be source-supported, it must remain manual verification rather than becoming verified output. Background guides are contextual material only and do not satisfy the evidence gate.
 
 ## Background guide handling
 
-The uploaded background guide is context only and cannot satisfy the evidence gate. The UI preserves the upload and sends file bytes as a Gemini `inlineData` file/document part when available. Text extraction is retained only as bounded metadata/context for legacy text uploads; the main prompt does not dump the full guide and never treats it as evidence. Unsupported file representations must be converted only through deterministic, bounded, non-AI handling.
-
-## Sliders
-
-Aggression, Controversy, Diplomacy, and Length affect research-priority allocation and final rhetoric. They never lower source-quality, claim-support, corroboration, freeze-date, or provenance requirements.
-
-- Higher controversy prioritizes documented controversies, contradictions, incidents, and commitment gaps when relevant.
-- Higher diplomacy prioritizes official commitments, treaties, votes, negotiations, and diplomatic contradictions.
-- Higher aggression prioritizes hardline policies, confrontational actions, direct clashes, escalation, and coercive measures.
-- Length controls density and legal/hook complexity without exceeding the 6–12 planner-query cap.
+Uploaded guide bytes are converted to a Blob and uploaded with the Gemini File API exposed by `@google/genai`. Requests include the returned file URI as a `fileData` part. The guide's Base64 bytes are not embedded in mission JSON or prompt text. Plain extracted text is retained only as bounded legacy context when no file bytes are present.
 
 ## Token guard
 
-ChitForge enforces an 80,000-token application safety budget before every Gemini generation call. It attempts the Gemini `countTokens` endpoint for the actual request (including native file/document parts) and falls back to the local character estimator only when SDK/API counting is unavailable. If the compact final request is still too large, ChitForge blocks locally with `input-budget-exceeded` before calling Gemini.
+ChitForge keeps the 80,000-token application safety budget before Gemini calls. File references are counted as request parts rather than serialized Base64 prompt text, so large background guides do not inflate the textual payload.
